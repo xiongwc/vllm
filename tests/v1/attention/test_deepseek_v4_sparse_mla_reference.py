@@ -25,7 +25,6 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
 )
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
 
-
 _FP8_DIM = 448
 _ROPE_DIM = 64
 _SCALE_DIM = 8
