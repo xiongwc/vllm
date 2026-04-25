@@ -130,11 +130,11 @@ def sparse_mla_reference_topk_chunk_size() -> int:
         _LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV
     )
     if raw_value is None:
-        return 256
+        return 512
     try:
         return max(1, int(raw_value))
     except ValueError:
-        return 256
+        return 512
 
 
 def sparse_mla_reference_query_chunk_size() -> int:
