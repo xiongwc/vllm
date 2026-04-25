@@ -10,7 +10,9 @@ import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.layers.deepseek_v4_attention import (
     _deepseek_v4_fp8_einsum_config,
+    deepseek_v4_fp8_einsum,
 )
+from vllm.utils.deep_gemm import fp8_einsum
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
@@ -46,6 +48,9 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
+    deepseek_v4_sm12_fp8_einsum,
+)
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 _FP8_DIM = 448
@@ -91,6 +96,135 @@ def test_deepseek_v4_fp8_einsum_config_for_sm12x(
         expected_recipe,
         expected_tma_aligned,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("use_e8m0_scale", [False, True])
+def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
+    use_e8m0_scale: bool,
+) -> None:
+    if use_e8m0_scale and not hasattr(torch, "float8_e8m0fnu"):
+        pytest.skip("torch does not expose float8_e8m0fnu")
+    torch.manual_seed(0)
+    num_tokens = 17
+    num_groups = 4
+    hidden_size = 4096
+    out_rank = 1024
+    recipe = (1, 128, 128)
+
+    a_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    a = a_backing.transpose(0, 1)
+    a_scale_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    a_scale = a_scale_backing.transpose(0, 1)
+    b_flat = torch.empty(
+        (num_groups * out_rank, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    b = b_flat.view(num_groups, out_rank, hidden_size)
+    if use_e8m0_scale:
+        scale_choices = torch.tensor(
+            [0.00390625, 0.0078125, 0.015625, 0.03125],
+            device="cuda",
+            dtype=torch.float32,
+        )
+        scale_indices = torch.randint(
+            0,
+            len(scale_choices),
+            (num_groups * (out_rank // 128), hidden_size // 128),
+            device="cuda",
+        )
+        b_scale_flat = scale_choices[scale_indices].to(torch.float8_e8m0fnu)
+        b_scale_ref_flat = b_scale_flat.to(torch.float32)
+    else:
+        b_scale_flat = torch.empty(
+            (num_groups * (out_rank // 128), hidden_size // 128),
+            device="cuda",
+            dtype=torch.float32,
+        ).uniform_(0.01, 0.02)
+        b_scale_ref_flat = b_scale_flat
+    b_scale_ref = b_scale_ref_flat.view(
+        num_groups, out_rank // 128, hidden_size // 128
+    )
+    expected = torch.empty(
+        (num_tokens, num_groups, out_rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    actual = torch.empty_like(expected)
+
+    fp8_einsum(
+        "bhr,hdr->bhd",
+        (a, a_scale),
+        (b, b_scale_ref),
+        expected,
+        recipe=recipe,
+    )
+    deepseek_v4_fp8_einsum(
+        a,
+        a_scale,
+        b_flat,
+        b_scale_flat,
+        actual,
+        "bhr,hdr->bhd",
+        list(recipe),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> None:
+    torch.manual_seed(0)
+    num_tokens = 17
+    num_groups = 4
+    hidden_size = 4096
+    out_rank = 1024
+    recipe = (1, 128, 128)
+
+    a_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    a = a_backing.transpose(0, 1)
+    a_scale_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    a_scale = a_scale_backing.transpose(0, 1)
+    b_flat = torch.empty(
+        (num_groups * out_rank, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    b = b_flat.view(num_groups, out_rank, hidden_size)
+    b_scale_flat = torch.empty(
+        (num_groups * (out_rank // 128), hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    b_scale = b_scale_flat.view(num_groups, out_rank // 128, hidden_size // 128)
+    expected = torch.empty(
+        (num_tokens, num_groups, out_rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    actual = torch.empty_like(expected)
+
+    fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), expected, recipe=recipe)
+    deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, actual)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _masked_scores(
