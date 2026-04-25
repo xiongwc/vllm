@@ -72,11 +72,10 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
-    accumulate_fp8ds_paged_sparse_mla_attention_chunk,
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
-    finish_gathered_sparse_mla_attention,
     finish_sparse_mla_attention_with_sink,
-    merge_two_sparse_mla_subsets_with_sink,
+    finish_two_sparse_mla_attention_states_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -817,7 +816,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_max_score.fill_(float("-inf"))
         swa_denom.zero_()
         swa_acc.zero_()
-        accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
             seq_lens=swa_metadata.seq_lens[:num_decodes],
@@ -830,6 +829,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
+            head_block_size=4,
         )
         finish_sparse_mla_attention_with_sink(
             swa_max_score,
@@ -873,28 +873,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         (
             comp_max_score,
             comp_denom,
-            comp_output,
-            comp_lse,
+            comp_acc,
             swa_max_score,
             swa_denom,
-            swa_output,
-            swa_lse,
+            swa_acc,
         ) = current_workspace_manager().get_simultaneous(
             ((num_decode_tokens, self.num_heads), torch.float32),
             ((num_decode_tokens, self.num_heads), torch.float32),
             ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
             ((num_decode_tokens, self.num_heads), torch.float32),
             ((num_decode_tokens, self.num_heads), torch.float32),
-            ((num_decode_tokens, self.num_heads), torch.float32),
             ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
-            ((num_decode_tokens, self.num_heads), torch.float32),
         )
         comp_max_score.fill_(float("-inf"))
         comp_denom.zero_()
-        comp_output.zero_()
+        comp_acc.zero_()
         swa_max_score.fill_(float("-inf"))
         swa_denom.zero_()
-        swa_output.zero_()
+        swa_acc.zero_()
 
         compressed_slot_ids = topk_indices[:, 0, :]
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
@@ -909,19 +905,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 scale=self.scale,
                 max_score=comp_max_score,
                 denom=comp_denom,
-                acc=comp_output,
+                acc=comp_acc,
                 head_block_size=4,
             )
-        finish_gathered_sparse_mla_attention(
-            comp_max_score,
-            comp_denom,
-            comp_output,
-            comp_output,
-            comp_lse,
-        )
-
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
-        accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
             seq_lens=swa_metadata.seq_lens[:num_decodes],
@@ -933,21 +921,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             scale=self.scale,
             max_score=swa_max_score,
             denom=swa_denom,
-            acc=swa_output,
+            acc=swa_acc,
+            head_block_size=4,
         )
-        finish_gathered_sparse_mla_attention(
+        finish_two_sparse_mla_attention_states_with_sink(
+            comp_max_score,
+            comp_denom,
+            comp_acc,
             swa_max_score,
             swa_denom,
-            swa_output,
-            swa_output,
-            swa_lse,
-        )
-        merge_two_sparse_mla_subsets_with_sink(
-            subset0_output=comp_output,
-            subset0_lse=comp_lse,
-            subset1_output=swa_output,
-            subset1_lse=swa_lse,
-            attn_sink=self.attn_sink,
+            swa_acc,
+            self.attn_sink,
             output=output,
         )
 
