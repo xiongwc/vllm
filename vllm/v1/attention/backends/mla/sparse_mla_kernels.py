@@ -1476,12 +1476,22 @@ def _finish_attention_state_with_sink_kernel(
     running_max = tl.load(max_score_ptr + state_offset)
     running_denom = tl.load(denom_ptr + state_offset)
     sink = tl.load(sink_ptr + head_idx)
-    merge_max = tl.maximum(running_max, sink)
     has_tokens = running_denom > 0.0
-    subset_scale = tl.where(has_tokens, tl.exp(running_max - merge_max), 0.0)
+    has_sink = sink > -float("inf")
+    valid_max = tl.where(has_tokens, running_max, -float("inf"))
+    valid_sink = tl.where(has_sink, sink, -float("inf"))
+    merge_max = tl.maximum(valid_max, valid_sink)
+    has_any = has_tokens | has_sink
+    safe_merge_max = tl.where(has_any, merge_max, 0.0)
+    safe_running_max = tl.where(has_tokens, running_max, safe_merge_max)
+    safe_sink = tl.where(has_sink, sink, safe_merge_max)
+    subset_scale = tl.where(
+        has_tokens, tl.exp(safe_running_max - safe_merge_max), 0.0
+    )
     subset_weight = running_denom * subset_scale
-    sink_weight = tl.exp(sink - merge_max)
-    inv_total = 1.0 / (subset_weight + sink_weight)
+    sink_weight = tl.where(has_sink, tl.exp(safe_sink - safe_merge_max), 0.0)
+    total_weight = subset_weight + sink_weight
+    inv_total = tl.where(total_weight > 0.0, 1.0 / total_weight, 0.0)
 
     acc_values = tl.load(
         acc_ptr
@@ -1491,6 +1501,7 @@ def _finish_attention_state_with_sink_kernel(
         mask=dim_mask,
         other=0.0,
     ).to(tl.float32)
+    acc_values = tl.where(has_tokens, acc_values, 0.0)
     output = acc_values * subset_scale * inv_total
     tl.store(
         output_ptr
@@ -1546,13 +1557,21 @@ def _finish_two_attention_states_with_sink_kernel(
 
     has0 = denom0 > 0.0
     has1 = denom1 > 0.0
+    has_sink = sink > -float("inf")
     valid_max0 = tl.where(has0, max0, -float("inf"))
     valid_max1 = tl.where(has1, max1, -float("inf"))
-    merge_max = tl.maximum(tl.maximum(valid_max0, valid_max1), sink)
-    scale0 = tl.where(has0, tl.exp(max0 - merge_max), 0.0)
-    scale1 = tl.where(has1, tl.exp(max1 - merge_max), 0.0)
-    sink_weight = tl.exp(sink - merge_max)
-    inv_total = 1.0 / (denom0 * scale0 + denom1 * scale1 + sink_weight)
+    valid_sink = tl.where(has_sink, sink, -float("inf"))
+    merge_max = tl.maximum(tl.maximum(valid_max0, valid_max1), valid_sink)
+    has_any = has0 | has1 | has_sink
+    safe_merge_max = tl.where(has_any, merge_max, 0.0)
+    safe_max0 = tl.where(has0, max0, safe_merge_max)
+    safe_max1 = tl.where(has1, max1, safe_merge_max)
+    safe_sink = tl.where(has_sink, sink, safe_merge_max)
+    scale0 = tl.where(has0, tl.exp(safe_max0 - safe_merge_max), 0.0)
+    scale1 = tl.where(has1, tl.exp(safe_max1 - safe_merge_max), 0.0)
+    sink_weight = tl.where(has_sink, tl.exp(safe_sink - safe_merge_max), 0.0)
+    total_weight = denom0 * scale0 + denom1 * scale1 + sink_weight
+    inv_total = tl.where(total_weight > 0.0, 1.0 / total_weight, 0.0)
 
     acc0 = tl.load(
         acc0_ptr
@@ -1570,6 +1589,8 @@ def _finish_two_attention_states_with_sink_kernel(
         mask=dim_mask,
         other=0.0,
     ).to(tl.float32)
+    acc0 = tl.where(has0, acc0, 0.0)
+    acc1 = tl.where(has1, acc1, 0.0)
     output = (acc0 * scale0 + acc1 * scale1) * inv_total
     tl.store(
         output_ptr

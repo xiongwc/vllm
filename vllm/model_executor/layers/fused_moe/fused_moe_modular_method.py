@@ -84,6 +84,14 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
     ) -> FusedMoEQuantConfig | None:
         return self.moe_quant_config
 
+    def reserve_workspace(self, layer: "FusedMoE") -> None:  # type: ignore[name-defined] # noqa: F821
+        self.moe_kernel.reserve_workspace(
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.global_num_experts,
+            layer.activation,
+        )
+
     def apply(
         self,
         layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821

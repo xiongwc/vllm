@@ -6,6 +6,9 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
 _TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
 _TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
 _TRITON_MLA_SPARSE_DUMP_PATH_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
@@ -22,6 +25,8 @@ _LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV = "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE
 
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
+
+logger = init_logger(__name__)
 
 
 def _optional_env_flag(name: str) -> bool | None:
@@ -50,14 +55,51 @@ def is_sparse_mla_attention_dump_enabled() -> bool:
     return _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV) or False
 
 
-def is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
+def sparse_mla_reference_attention_configured() -> bool | None:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
     if configured is not None:
         return configured
-    legacy_configured = _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
-    if legacy_configured is not None:
-        return legacy_configured
+    return _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
+
+
+def is_sparse_mla_reference_attention_enabled_for_platform() -> bool:
+    configured = sparse_mla_reference_attention_configured()
+    if configured is not None:
+        return configured
+    return current_platform.is_device_capability_family(120)
+
+
+def is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
+    configured = sparse_mla_reference_attention_configured()
+    if configured is not None:
+        return configured
     return _is_sm12x_device(device)
+
+
+def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
+    if not is_sparse_mla_reference_attention_enabled_for_platform():
+        return
+
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    compilation_config = vllm_config.compilation_config
+    if (
+        compilation_config.mode == CompilationMode.NONE
+        and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    ):
+        return
+
+    logger.warning_once(
+        "Disabling vLLM compile and CUDA graphs for the DeepSeek V4 Triton "
+        "sparse MLA fallback because the current fallback path is not "
+        "compile/graph-safe yet."
+    )
+    compilation_config.mode = CompilationMode.NONE
+    compilation_config.compile_sizes = []
+    compilation_config.compile_ranges_endpoints = []
+    compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    compilation_config.cudagraph_capture_sizes = []
+    compilation_config.max_cudagraph_capture_size = 0
 
 
 def sparse_mla_attention_dump_path() -> str:
