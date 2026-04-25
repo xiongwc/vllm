@@ -20,7 +20,7 @@ else()
   FetchContent_Declare(
     deepgemm
     GIT_REPOSITORY https://github.com/jasl/DeepGEMM.git
-    GIT_TAG 959f1df759ed591cadb463ab9af68222428de5df
+    GIT_TAG dd05d89b038165f1c85648d239c2b5ff14fd4ba7
     GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
