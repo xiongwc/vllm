@@ -23,7 +23,6 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
-    dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
@@ -72,6 +71,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     sparse_mla_reference_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
     accumulate_gathered_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
     merge_two_sparse_mla_subsets_with_sink,
@@ -871,7 +871,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             sparse_mla_reference_topk_chunk_size(),
         )
         (
-            compressed_kv,
             swa_kv,
             comp_max_score,
             comp_denom,
@@ -882,7 +881,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             swa_output,
             swa_lse,
         ) = current_workspace_manager().get_simultaneous(
-            ((num_decode_tokens, topk_chunk_size, q.shape[-1]), torch.bfloat16),
             ((num_decode_tokens, max_swa_len, q.shape[-1]), torch.bfloat16),
             ((num_decode_tokens, self.num_heads), torch.float32),
             ((num_decode_tokens, self.num_heads), torch.float32),
@@ -904,21 +902,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_slot_ids = topk_indices[:, 0, :]
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
-            chunk_size = chunk_end - chunk_start
-            compressed_kv_chunk = compressed_kv[:, :chunk_size, :]
-            topk_chunk = topk_indices[:, :, chunk_start:chunk_end]
-            compressed_kv_chunk.zero_()
-            dequantize_global_slots_k_cache(
-                compressed_kv_chunk,
-                compressed_k_cache,
-                topk_chunk,
-                block_size=compressed_block_size,
-            )
-            accumulate_gathered_sparse_mla_attention_chunk(
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
                 q=q,
-                kv=compressed_kv_chunk,
+                k_cache=compressed_k_cache,
                 slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
                 lens=topk_lens,
+                block_size=compressed_block_size,
                 candidate_offset=chunk_start,
                 scale=self.scale,
                 max_score=comp_max_score,
