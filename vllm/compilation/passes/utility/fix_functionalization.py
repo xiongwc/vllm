@@ -153,6 +153,58 @@ class FixFunctionalizationPass(VllmInductorPass):
                         "input_global_scale",
                     ),
                 )
+            elif (
+                hasattr(torch.ops._C, "per_token_group_fp8_quant")
+                and at_target == torch.ops._C.per_token_group_fp8_quant.default
+            ):
+                mutated_args = {1: "output_q", 2: "output_s"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "input",
+                        "output_q",
+                        "output_s",
+                        "group_size",
+                        "eps",
+                        "fp8_min",
+                        "fp8_max",
+                        "scale_ue8m0",
+                        "dummy_is_scale_transposed",
+                        "dummy_is_tma_aligned",
+                    ),
+                )
+            elif (
+                hasattr(torch.ops._C, "cutlass_scaled_mm")
+                and at_target == torch.ops._C.cutlass_scaled_mm.default
+            ):
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=("out", "a", "b", "a_scales", "b_scales", "bias"),
+                )
+            elif (
+                hasattr(torch.ops.vllm, "deepseek_v4_fp8_einsum")
+                and at_target == torch.ops.vllm.deepseek_v4_fp8_einsum.default
+            ):
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "a",
+                        "a_scale",
+                        "b",
+                        "b_scale",
+                        "out",
+                        "equation",
+                        "recipe",
+                    ),
+                )
             # Defunctionalize fused_qk_norm_rope to remove higher-order wrapper.
             elif at_target == torch.ops._C.fused_qk_norm_rope.default:
                 mutated_args = {1: "qkv"}

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+import os
 from typing import ClassVar, cast
 
 import torch
@@ -30,6 +31,33 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
+_SM120_REFERENCE_ATTENTION_ENV = "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
+
+
+def _is_sm120_attention_dump_enabled() -> bool:
+    return os.getenv(_SM120_ATTENTION_DUMP_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_sm120_reference_attention_enabled() -> bool:
+    return os.getenv(_SM120_REFERENCE_ATTENTION_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_sm120_device(device: torch.device) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(index)[0] == 12
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -363,6 +391,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             _LAYER_TYPE_C128A: None,
         }
         if num_decode_tokens == 0:
+            return out
+        if (
+            _is_sm120_device(self.device)
+            and (
+                _is_sm120_attention_dump_enabled()
+                or _is_sm120_reference_attention_enabled()
+            )
+        ):
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
