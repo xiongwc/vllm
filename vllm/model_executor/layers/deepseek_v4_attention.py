@@ -73,12 +73,10 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
-)
-from vllm.v1.attention.backends.mla.sparse_mla_reference import (
-    reference_sparse_mla_prefill,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -975,17 +973,71 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         combined_lens: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        reference_sparse_mla_prefill(
-            q=q,
-            kv=kv,
-            combined_indices=combined_indices,
-            combined_lens=combined_lens,
-            scale=self.scale,
-            attn_sink=self.attn_sink,
-            output=output,
-            topk_chunk_size=sparse_mla_reference_topk_chunk_size(),
-            query_chunk_size=sparse_mla_reference_query_chunk_size(),
+        kv_flat = kv.reshape(-1, q.shape[-1])
+        topk_chunk_size = min(
+            combined_indices.shape[-1],
+            sparse_mla_reference_topk_chunk_size(),
         )
+        query_chunk_size = min(
+            q.shape[0],
+            sparse_mla_reference_query_chunk_size(),
+        )
+        (
+            max_score_buffer,
+            denom_buffer,
+            output_buffer,
+            lse_buffer,
+        ) = current_workspace_manager().get_simultaneous(
+            ((query_chunk_size, q.shape[1]), torch.float32),
+            ((query_chunk_size, q.shape[1]), torch.float32),
+            ((query_chunk_size, q.shape[1], q.shape[-1]), torch.float32),
+            ((query_chunk_size, q.shape[1]), torch.float32),
+        )
+
+        for token_start in range(0, q.shape[0], query_chunk_size):
+            token_end = min(token_start + query_chunk_size, q.shape[0])
+            q_chunk = q[token_start:token_end]
+            indices_chunk_full = combined_indices[token_start:token_end]
+            lens_chunk = combined_lens[token_start:token_end]
+            num_tokens = token_end - token_start
+            max_score = max_score_buffer[:num_tokens]
+            denom = denom_buffer[:num_tokens]
+            subset_output = output_buffer[:num_tokens]
+            subset_lse = lse_buffer[:num_tokens]
+            max_score.fill_(float("-inf"))
+            denom.zero_()
+            subset_output.zero_()
+
+            for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
+                index_end = min(
+                    index_start + topk_chunk_size,
+                    combined_indices.shape[-1],
+                )
+                accumulate_indexed_sparse_mla_attention_chunk(
+                    q=q_chunk,
+                    kv_flat=kv_flat,
+                    indices=indices_chunk_full[:, index_start:index_end],
+                    lens=lens_chunk,
+                    candidate_offset=index_start,
+                    scale=self.scale,
+                    max_score=max_score,
+                    denom=denom,
+                    acc=subset_output,
+                )
+
+            finish_gathered_sparse_mla_attention(
+                max_score,
+                denom,
+                subset_output,
+                subset_output,
+                subset_lse,
+            )
+            merge_sparse_mla_subset_with_sink(
+                subset_output=subset_output,
+                subset_lse=subset_lse,
+                attn_sink=self.attn_sink,
+                output=output[token_start:token_end],
+            )
 
     def forward(
         self,

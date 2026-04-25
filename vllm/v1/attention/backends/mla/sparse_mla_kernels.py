@@ -375,6 +375,156 @@ def accumulate_gathered_sparse_mla_attention_chunk(
 
 
 @triton.jit
+def _accumulate_indexed_attention_chunk_kernel(
+    q_ptr,
+    kv_flat_ptr,
+    indices_ptr,
+    lens_ptr,
+    max_score_ptr,
+    denom_ptr,
+    acc_ptr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_kv_t,
+    stride_kv_d: tl.constexpr,
+    stride_indices_t: tl.constexpr,
+    stride_indices_c: tl.constexpr,
+    stride_state_t: tl.constexpr,
+    stride_state_h: tl.constexpr,
+    stride_acc_t: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    stride_acc_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_candidates,
+    candidate_offset,
+    scale: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_D)
+    dim_mask = offsets < head_dim
+
+    q = tl.load(
+        q_ptr
+        + token_idx * stride_q_t
+        + head_idx * stride_q_h
+        + offsets * stride_q_d,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    state_offset = token_idx * stride_state_t + head_idx * stride_state_h
+    acc_offset = (
+        token_idx * stride_acc_t
+        + head_idx * stride_acc_h
+        + offsets * stride_acc_d
+    )
+    running_max = tl.load(max_score_ptr + state_offset)
+    running_denom = tl.load(denom_ptr + state_offset)
+    running_acc = tl.load(acc_ptr + acc_offset, mask=dim_mask, other=0.0).to(
+        tl.float32
+    )
+    valid_len = tl.load(lens_ptr + token_idx)
+
+    for candidate_idx in range(0, num_candidates):
+        kv_index = tl.load(
+            indices_ptr
+            + token_idx * stride_indices_t
+            + candidate_idx * stride_indices_c
+        )
+        is_valid = ((candidate_offset + candidate_idx) < valid_len) & (
+            kv_index >= 0
+        )
+
+        if is_valid:
+            kv = tl.load(
+                kv_flat_ptr
+                + kv_index.to(tl.int64) * stride_kv_t
+                + offsets * stride_kv_d,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.sum(q * kv, axis=0) * scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = running_acc * previous_weight + kv * candidate_weight
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+    tl.store(max_score_ptr + state_offset, running_max)
+    tl.store(denom_ptr + state_offset, running_denom)
+    tl.store(acc_ptr + acc_offset, running_acc, mask=dim_mask)
+
+
+def accumulate_indexed_sparse_mla_attention_chunk(
+    q: torch.Tensor,
+    kv_flat: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    scale: float,
+    max_score: torch.Tensor,
+    denom: torch.Tensor,
+    acc: torch.Tensor,
+    candidate_offset: int = 0,
+) -> None:
+    if q.dim() == 4:
+        assert q.shape[1] == 1
+        q = q[:, 0]
+
+    assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
+    assert kv_flat.dim() == 2
+    assert indices.dim() == 2
+    assert indices.shape[0] == q.shape[0]
+    assert kv_flat.shape[-1] == q.shape[-1]
+    assert lens.shape[0] == q.shape[0]
+    assert max_score.shape == q.shape[:2]
+    assert denom.shape == q.shape[:2]
+    assert acc.shape == q.shape
+    assert max_score.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert acc.dtype == torch.float32
+    assert q.is_cuda and kv_flat.is_cuda and indices.is_cuda and lens.is_cuda
+    assert max_score.is_cuda and denom.is_cuda and acc.is_cuda
+
+    num_tokens, num_heads, head_dim = q.shape
+    num_candidates = indices.shape[1]
+    block_d = min(1024, triton.next_power_of_2(head_dim))
+    grid = (num_tokens, num_heads)
+    _accumulate_indexed_attention_chunk_kernel[grid](
+        q,
+        kv_flat,
+        indices,
+        lens,
+        max_score,
+        denom,
+        acc,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_flat.stride(0),
+        kv_flat.stride(1),
+        indices.stride(0),
+        indices.stride(1),
+        max_score.stride(0),
+        max_score.stride(1),
+        acc.stride(0),
+        acc.stride(1),
+        acc.stride(2),
+        num_heads,
+        head_dim,
+        num_candidates,
+        candidate_offset,
+        scale,
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
