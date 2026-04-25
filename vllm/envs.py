@@ -169,14 +169,9 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_DUMP: bool = False
     VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str = ""
-    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int | None = None
-    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int | None = None
-    VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = False
-    VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION: bool = False
-    VLLM_SM120_ATTENTION_DUMP_PATH: str = ""
-    VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION: bool = False
-    VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE: int | None = None
-    VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1294,32 +1289,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TRITON_MLA_SPARSE_DUMP_PATH", ""
     ),
     "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: maybe_convert_int(
-        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE")
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
     ),
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
-        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE")
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
     ),
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH": lambda: (
-        os.getenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "").lower()
+        os.getenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "1").lower()
         in ("1", "true", "yes", "on")
-    ),
-    # Legacy names kept as aliases for the SM120 prototype scripts.
-    "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION": lambda: (
-        os.getenv("VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION", "").lower()
-        in ("1", "true", "yes", "on")
-    ),
-    "VLLM_SM120_ATTENTION_DUMP_PATH": lambda: os.getenv(
-        "VLLM_SM120_ATTENTION_DUMP_PATH", ""
-    ),
-    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION": lambda: (
-        os.getenv("VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION", "").lower()
-        in ("1", "true", "yes", "on")
-    ),
-    "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE": lambda: maybe_convert_int(
-        os.getenv("VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE")
-    ),
-    "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
-        os.getenv("VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

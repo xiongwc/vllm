@@ -18,14 +18,6 @@ _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH"
 )
 
-_LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
-_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV = "VLLM_SM120_ATTENTION_DUMP_PATH"
-_LEGACY_SM120_REFERENCE_ATTENTION_ENV = (
-    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
-)
-_LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV = "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE"
-_LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV = "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE"
-
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
 
@@ -55,14 +47,11 @@ def is_sparse_mla_attention_dump_enabled() -> bool:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
     if configured is not None:
         return configured
-    return _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV) or False
+    return False
 
 
 def sparse_mla_reference_attention_configured() -> bool | None:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
-    if configured is not None:
-        return configured
-    return _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
+    return _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
 
 
 def is_sparse_mla_reference_attention_enabled_for_platform() -> bool:
@@ -80,7 +69,10 @@ def is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
 
 
 def sparse_mla_reference_cudagraphs_allowed() -> bool:
-    return _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV) or False
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
+    if configured is not None:
+        return configured
+    return True
 
 
 def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
@@ -120,15 +112,12 @@ def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
 def sparse_mla_attention_dump_path() -> str:
     return (
         os.getenv(_TRITON_MLA_SPARSE_DUMP_PATH_ENV)
-        or os.getenv(_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV)
         or "/tmp/deepseek_v4_triton_mla_sparse_dump.jsonl"
     )
 
 
 def sparse_mla_reference_topk_chunk_size() -> int:
-    raw_value = os.getenv(_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV) or os.getenv(
-        _LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV
-    )
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV)
     if raw_value is None:
         return 512
     try:
@@ -138,9 +127,7 @@ def sparse_mla_reference_topk_chunk_size() -> int:
 
 
 def sparse_mla_reference_query_chunk_size() -> int:
-    raw_value = os.getenv(_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV) or os.getenv(
-        _LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV
-    )
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV)
     if raw_value is None:
         return 256
     try:
