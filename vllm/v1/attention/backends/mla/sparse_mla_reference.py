@@ -156,3 +156,69 @@ def sink_aware_reference_attention(
         attn_sink=attn_sink,
         output=output,
     )
+
+
+def reference_sparse_mla_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    topk_chunk_size: int,
+    query_chunk_size: int,
+) -> None:
+    kv_flat = kv.reshape(-1, q.shape[-1])
+    topk_chunk_size = min(combined_indices.shape[-1], topk_chunk_size)
+    query_chunk_size = min(q.shape[0], query_chunk_size)
+
+    for token_start in range(0, q.shape[0], query_chunk_size):
+        token_end = min(token_start + query_chunk_size, q.shape[0])
+        q_chunk = q[token_start:token_end]
+        lens_chunk = combined_lens[token_start:token_end]
+        indices_chunk_full = combined_indices[token_start:token_end]
+        q_bhd, max_score, denom, acc = new_reference_attention_state(q_chunk)
+
+        for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
+            index_end = min(
+                index_start + topk_chunk_size,
+                combined_indices.shape[-1],
+            )
+            indices_chunk = indices_chunk_full[:, index_start:index_end]
+            index_offsets = torch.arange(
+                index_start,
+                index_end,
+                device=q.device,
+            )
+            valid_tokens = (
+                (index_offsets[None, :] < lens_chunk[:, None])
+                & (indices_chunk >= 0)
+            )
+            safe_indices = torch.where(
+                valid_tokens,
+                indices_chunk,
+                torch.zeros((), dtype=indices_chunk.dtype, device=q.device),
+            ).long()
+            gathered_kv = kv_flat[safe_indices]
+            max_score, denom, acc = accumulate_reference_attention_chunk(
+                q_bhd=q_bhd,
+                kv=gathered_kv,
+                valid_tokens=valid_tokens,
+                max_score=max_score,
+                denom=denom,
+                acc=acc,
+                scale=scale,
+            )
+
+        subset_output, subset_lse = finish_reference_attention_no_sink(
+            max_score,
+            denom,
+            acc,
+        )
+        merge_reference_attention_with_sink(
+            subset_outputs=[subset_output],
+            subset_lses=[subset_lse],
+            attn_sink=attn_sink,
+            output=output[token_start:token_end],
+        )
