@@ -7,6 +7,7 @@ import torch
 
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk,
     accumulate_gathered_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
     merge_two_sparse_mla_subsets_with_sink,
@@ -528,6 +529,101 @@ def test_triton_fp8ds_global_slots_attention_chunk_matches_reference() -> None:
                 gathered[token_idx, topk_idx] = expected_by_slot[slot]
     offsets = torch.arange(slot_ids.shape[1], device="cuda")
     valid_tokens = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
+    expected_output, expected_lse = reference_attention_no_sink(
+        q,
+        gathered,
+        valid_tokens,
+        scale,
+    )
+
+    torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_fp8ds_paged_attention_chunk_matches_reference() -> None:
+    torch.manual_seed(12)
+    block_size = 4
+    k_cache = torch.zeros(
+        3,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_table = torch.tensor(
+        [
+            [1, 0, 2],
+            [2, 1, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([6, 9], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 4], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
+    scale = 0.0625
+
+    gathered = torch.zeros(2, 4, 512, device="cuda", dtype=torch.bfloat16)
+    expected_by_slot: dict[int, torch.Tensor] = {}
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            block_idx = pos // block_size
+            block_offset = pos % block_size
+            physical_block = int(block_table[token_idx, block_idx].item())
+            slot = physical_block * block_size + block_offset
+            expected_by_slot.setdefault(
+                slot,
+                _write_fp8_ds_mla_token(k_cache, slot, block_size),
+            )
+            gathered[token_idx, gather_idx] = expected_by_slot[slot]
+
+    max_score = torch.full((2, 3), float("-inf"), device="cuda")
+    denom = torch.zeros((2, 3), device="cuda")
+    acc = torch.zeros((2, 3, 512), device="cuda")
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=2,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=2,
+        num_candidates=2,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+
+    output = torch.empty_like(acc)
+    lse = torch.empty_like(max_score)
+    finish_gathered_sparse_mla_attention(
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        output=output,
+        lse=lse,
+    )
+
+    offsets = torch.arange(gathered.shape[1], device="cuda")
+    valid_tokens = offsets[None, :] < gather_lens[:, None]
     expected_output, expected_lse = reference_attention_no_sink(
         q,
         gathered,
