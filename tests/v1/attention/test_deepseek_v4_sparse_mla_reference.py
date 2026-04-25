@@ -72,11 +72,41 @@ def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
 def test_triton_sparse_mla_decode_head_block_size(
     num_decode_tokens: int,
     expected_head_block_size: int,
+    monkeypatch,
 ) -> None:
+    monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE", raising=False)
+
     assert (
         sparse_mla_decode_head_block_size(num_decode_tokens)
         == expected_head_block_size
     )
+
+
+@pytest.mark.parametrize("configured_head_block_size", ["1", "2", "4"])
+def test_triton_sparse_mla_decode_head_block_size_env_override(
+    configured_head_block_size: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE",
+        configured_head_block_size,
+    )
+
+    assert sparse_mla_decode_head_block_size(1) == int(configured_head_block_size)
+    assert sparse_mla_decode_head_block_size(32) == int(configured_head_block_size)
+
+
+@pytest.mark.parametrize("configured_head_block_size", ["0", "3", "invalid"])
+def test_triton_sparse_mla_decode_head_block_size_ignores_invalid_env_override(
+    configured_head_block_size: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE",
+        configured_head_block_size,
+    )
+
+    assert sparse_mla_decode_head_block_size(8) == 4
 
 
 @pytest.mark.parametrize(
@@ -186,6 +216,54 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> Non
     torch.manual_seed(0)
     num_tokens = 17
     num_groups = 4
+    hidden_size = 4096
+    out_rank = 1024
+    recipe = (1, 128, 128)
+
+    a_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    a = a_backing.transpose(0, 1)
+    a_scale_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    a_scale = a_scale_backing.transpose(0, 1)
+    b_flat = torch.empty(
+        (num_groups * out_rank, hidden_size),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    b = b_flat.view(num_groups, out_rank, hidden_size)
+    b_scale_flat = torch.empty(
+        (num_groups * (out_rank // 128), hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    b_scale = b_scale_flat.view(num_groups, out_rank // 128, hidden_size // 128)
+    expected = torch.empty(
+        (num_tokens, num_groups, out_rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    actual = torch.empty_like(expected)
+
+    fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), expected, recipe=recipe)
+    deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, actual)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("num_groups", [1, 2, 4])
+def test_deepseek_v4_sm12_triton_fp8_einsum_supports_tp_local_group_counts(
+    num_groups: int,
+) -> None:
+    torch.manual_seed(18 + num_groups)
+    num_tokens = 5
     hidden_size = 4096
     out_rank = 1024
     recipe = (1, 128, 128)
@@ -1499,6 +1577,197 @@ def test_triton_fp8ds_global_paged_attention_with_sink_direct_matches_state_path
         attn_sink=sink,
         output=actual,
         head_block_size=head_block_size,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64])
+def test_triton_fp8ds_paged_attention_with_sink_supports_tp_local_heads(
+    num_heads: int,
+) -> None:
+    torch.manual_seed(37 + num_heads)
+    block_size = 4
+    k_cache = torch.zeros(
+        4,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_table = torch.tensor(
+        [[1, 0, 2, 3], [2, 3, 1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(-0.5, 0.5, num_heads, device="cuda")
+    scale = 0.0625
+
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            physical_block = int(block_table[token_idx, pos // block_size].item())
+            slot = physical_block * block_size + pos % block_size
+            _write_fp8_ds_mla_token(k_cache, slot, block_size)
+
+    max_score = torch.full((2, num_heads), float("-inf"), device="cuda")
+    denom = torch.zeros((2, num_heads), device="cuda")
+    acc = torch.zeros((2, num_heads, 512), device="cuda")
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        head_block_size=1,
+    )
+    expected = torch.empty(2, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, expected)
+
+    actual = torch.empty_like(expected)
+    fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        attn_sink=sink,
+        output=actual,
+        head_block_size=4,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 64])
+def test_triton_fp8ds_global_paged_attention_with_sink_supports_tp_local_heads(
+    num_heads: int,
+) -> None:
+    torch.manual_seed(41 + num_heads)
+    compressed_block_size = 4
+    swa_block_size = 4
+    compressed_cache = torch.zeros(
+        4,
+        compressed_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    swa_cache = torch.zeros(
+        4,
+        swa_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    slot_ids = torch.tensor(
+        [[0, 3, -1, 8, 1], [7, -1, 4, 0, 8]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor(
+        [[1, 0, 2, 3], [2, 3, 1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(-1.0, 1.0, num_heads, device="cuda")
+    scale = 0.0625
+
+    for slot in (0, 1, 3, 4, 7, 8):
+        _write_fp8_ds_mla_token(compressed_cache, slot, compressed_block_size)
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            physical_block = int(block_table[token_idx, pos // swa_block_size].item())
+            slot = physical_block * swa_block_size + pos % swa_block_size
+            _write_fp8_ds_mla_token(swa_cache, slot, swa_block_size)
+
+    comp_max = torch.full((2, num_heads), float("-inf"), device="cuda")
+    comp_denom = torch.zeros((2, num_heads), device="cuda")
+    comp_acc = torch.zeros((2, num_heads, 512), device="cuda")
+    swa_max = torch.full((2, num_heads), float("-inf"), device="cuda")
+    swa_denom = torch.zeros((2, num_heads), device="cuda")
+    swa_acc = torch.zeros((2, num_heads, 512), device="cuda")
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=compressed_cache,
+        slot_ids=slot_ids,
+        lens=topk_lens,
+        block_size=compressed_block_size,
+        candidate_offset=0,
+        scale=scale,
+        max_score=comp_max,
+        denom=comp_denom,
+        acc=comp_acc,
+        head_block_size=1,
+    )
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=swa_block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        max_score=swa_max,
+        denom=swa_denom,
+        acc=swa_acc,
+        head_block_size=1,
+    )
+    expected = torch.empty(2, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    finish_two_sparse_mla_attention_states_with_sink(
+        comp_max,
+        comp_denom,
+        comp_acc,
+        swa_max,
+        swa_denom,
+        swa_acc,
+        sink,
+        expected,
+    )
+
+    actual = torch.empty_like(expected)
+    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+        q=q,
+        compressed_k_cache=compressed_cache,
+        slot_ids=slot_ids,
+        topk_lens=topk_lens,
+        compressed_block_size=compressed_block_size,
+        swa_k_cache=swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        swa_block_size=swa_block_size,
+        num_compressed_candidates=5,
+        num_swa_candidates=5,
+        scale=scale,
+        attn_sink=sink,
+        output=actual,
+        head_block_size=4,
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

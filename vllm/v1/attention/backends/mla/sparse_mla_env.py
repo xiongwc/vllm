@@ -17,6 +17,7 @@ _TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
 _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH"
 )
+_TRITON_MLA_SPARSE_HEAD_BLOCK_ENV = "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"
 
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
@@ -134,3 +135,16 @@ def sparse_mla_reference_query_chunk_size() -> int:
         return max(1, int(raw_value))
     except ValueError:
         return 256
+
+
+def sparse_mla_reference_head_block_size() -> int | None:
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_HEAD_BLOCK_ENV)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    if value in (1, 2, 4):
+        return value
+    return None
