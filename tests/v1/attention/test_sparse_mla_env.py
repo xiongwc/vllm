@@ -7,12 +7,14 @@ from contextlib import contextmanager
 
 import torch
 
+from vllm.envs import environment_variables
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_sparse_mla_attention_dump_enabled,
     is_sparse_mla_reference_attention_enabled,
     sparse_mla_attention_dump_path,
     sparse_mla_reference_attention_configured,
     sparse_mla_reference_cudagraphs_allowed,
+    sparse_mla_reference_head_block_size,
     sparse_mla_reference_query_chunk_size,
     sparse_mla_reference_topk_chunk_size,
 )
@@ -24,6 +26,7 @@ _SPARSE_MLA_ENV_NAMES = (
     "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE",
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE",
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH",
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE",
     "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION",
     "VLLM_SM120_ATTENTION_DUMP_PATH",
     "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION",
@@ -90,6 +93,33 @@ def test_sparse_mla_cudagraph_env_defaults_to_allowed() -> None:
 
     with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH="1"):
         assert sparse_mla_reference_cudagraphs_allowed()
+
+
+def test_sparse_mla_head_block_env_accepts_supported_values() -> None:
+    with _patched_sparse_mla_env():
+        assert sparse_mla_reference_head_block_size() is None
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE="1"):
+        assert sparse_mla_reference_head_block_size() == 1
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE="2"):
+        assert sparse_mla_reference_head_block_size() == 2
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE="4"):
+        assert sparse_mla_reference_head_block_size() == 4
+
+
+def test_sparse_mla_head_block_env_ignores_invalid_values() -> None:
+    for value in ("0", "3", "invalid"):
+        with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE=value):
+            assert sparse_mla_reference_head_block_size() is None
+
+
+def test_sparse_mla_head_block_env_is_registered_with_vllm_envs() -> None:
+    assert "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE" in environment_variables
+
+    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE="4"):
+        assert environment_variables["VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"]() == 4
 
 
 def test_sparse_mla_chunk_env_defaults_invalid_values() -> None:

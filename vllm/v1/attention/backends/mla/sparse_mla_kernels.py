@@ -5,6 +5,9 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    sparse_mla_reference_head_block_size,
+)
 
 
 def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
@@ -15,6 +18,9 @@ def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
     reuse each dequantized KV row across multiple heads.
     """
 
+    configured_head_block_size = sparse_mla_reference_head_block_size()
+    if configured_head_block_size is not None:
+        return configured_head_block_size
     if num_decode_tokens <= 1:
         return 1
     if num_decode_tokens < 8:
