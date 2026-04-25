@@ -2,9 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness tests for the DeepSeek V4 sparse MLA reference path."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    FlashMLASparseMetadataBuilder,
+)
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    disable_sparse_mla_reference_cudagraphs_if_enabled,
+)
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
@@ -27,7 +37,9 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     reference_sparse_mla_prefill,
     sink_aware_reference_attention,
 )
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 _FP8_DIM = 448
 _ROPE_DIM = 64
@@ -192,6 +204,28 @@ def test_reference_attention_no_sink_matches_logsumexp() -> None:
 
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
+
+
+
+def test_reference_attention_ignores_nan_kv_for_invalid_tokens() -> None:
+    torch.manual_seed(24)
+    q = torch.randn(2, 1, 3, 8)
+    kv = torch.randn(2, 4, 8)
+    kv[:, 2:] = float("nan")
+    valid_tokens = torch.tensor(
+        [[True, True, False, False], [True, False, False, False]],
+        dtype=torch.bool,
+    )
+
+    output, lse = reference_attention_no_sink(
+        q=q,
+        kv=kv,
+        valid_tokens=valid_tokens,
+        scale=0.125,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(lse).all()
 
 
 def test_sink_aware_reference_attention_matches_dense_golden() -> None:
@@ -371,6 +405,48 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_finish_with_sink_returns_zero_when_no_tokens_or_sink() -> None:
+    max_score = torch.full((2, 3), float("-inf"), device="cuda")
+    denom = torch.zeros((2, 3), device="cuda")
+    acc = torch.full((2, 3, 17), float("nan"), device="cuda")
+    sink = torch.full((3,), float("-inf"), device="cuda")
+
+    single_output = torch.full(
+        (2, 3, 17), 7.0, device="cuda", dtype=torch.bfloat16
+    )
+    finish_sparse_mla_attention_with_sink(
+        max_score,
+        denom,
+        acc,
+        sink,
+        output=single_output,
+    )
+    torch.testing.assert_close(
+        single_output.float(),
+        torch.zeros_like(single_output.float()),
+        rtol=0,
+        atol=0,
+    )
+
+    two_output = torch.full((2, 3, 17), 7.0, device="cuda", dtype=torch.bfloat16)
+    finish_two_sparse_mla_attention_states_with_sink(
+        max_score,
+        denom,
+        acc,
+        max_score,
+        denom,
+        acc,
+        sink,
+        output=two_output,
+    )
+    torch.testing.assert_close(
+        two_output.float(),
+        torch.zeros_like(two_output.float()),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
     torch.manual_seed(22)
     comp_max = torch.randn(4, 3, device="cuda", dtype=torch.float32)
@@ -1226,3 +1302,53 @@ def test_chunked_reference_accumulation_matches_one_shot(chunk_size: int) -> Non
 
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
+
+def test_triton_sparse_mla_fallback_disables_cudagraph_support(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
+
+    mla_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+
+    assert FlashMLASparseMetadataBuilder.get_cudagraph_support(None, mla_spec) is (
+        AttentionCGSupport.NEVER
+    )
+    assert DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(None, swa_spec) is (
+        AttentionCGSupport.NEVER
+    )
+
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            compile_sizes=[1, 2],
+            compile_ranges_endpoints=[8192],
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_capture_sizes=[1, 2, 4],
+            max_cudagraph_capture_size=4,
+        )
+    )
+    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.NONE
+    assert vllm_config.compilation_config.compile_sizes == []
+    assert vllm_config.compilation_config.compile_ranges_endpoints == []
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == []
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 0

@@ -18,10 +18,12 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_sparse_mla_attention_dump_enabled,
     is_sparse_mla_reference_attention_enabled,
+    is_sparse_mla_reference_attention_enabled_for_platform,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -197,6 +199,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     # Base threshold: query_len <= 1 is decode
     reorder_batch_threshold: int = 1
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if (
+            getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
+            and is_sparse_mla_reference_attention_enabled_for_platform()
+        ):
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

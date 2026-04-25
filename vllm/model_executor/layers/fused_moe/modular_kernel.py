@@ -1101,6 +1101,46 @@ class FusedMoEKernelModularImpl:
 
         return workspace13, workspace2, fused_out
 
+    def reserve_workspace(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        global_num_experts: int,
+        activation: MoEActivation,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        moe_config = self.fused_experts.moe_config
+        max_num_tokens = max_num_tokens or moe_config.max_num_tokens
+        dummy_hidden_states = torch.empty(
+            (max_num_tokens, moe_config.hidden_dim),
+            device="meta",
+        )
+        dummy_topk_ids = torch.empty(
+            (max_num_tokens, moe_config.experts_per_token),
+            device="meta",
+            dtype=torch.int32,
+        )
+        _, max_m, n, k, top_k = self.fused_experts.moe_problem_size(
+            dummy_hidden_states,
+            w1,
+            w2,
+            dummy_topk_ids,
+        )
+        local_num_experts = w1.shape[0]
+        self._allocate_buffers(
+            moe_config.in_dtype,
+            w1.device,
+            max_m,
+            max_m,
+            n,
+            k,
+            top_k,
+            global_num_experts,
+            local_num_experts,
+            None,
+            activation,
+        )
+
     def _maybe_apply_shared_experts(
         self,
         shared_experts_input: torch.Tensor | None,
@@ -1564,6 +1604,23 @@ class FusedMoEKernel:
         is reduced across all ranks.
         """
         return self.prepare_finalize.output_is_reduced()
+
+    def reserve_workspace(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        global_num_experts: int,
+        activation: MoEActivation,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        self.impl.reserve_workspace(
+            w1,
+            w2,
+            global_num_experts,
+            activation,
+            max_num_tokens=max_num_tokens,
+        )
 
     def apply_monolithic(
         self,

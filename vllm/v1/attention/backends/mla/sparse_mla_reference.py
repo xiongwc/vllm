@@ -47,6 +47,11 @@ def accumulate_reference_attention_chunk(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     kv_btd = kv.float()
+    kv_btd = torch.where(
+        valid_tokens[:, :, None],
+        kv_btd,
+        torch.zeros((), dtype=kv_btd.dtype, device=kv_btd.device),
+    )
     scores = torch.einsum("bhd,btd->bht", q_bhd, kv_btd) * scale
     scores = scores.masked_fill(~valid_tokens[:, None, :], float("-inf"))
 
@@ -124,15 +129,28 @@ def merge_reference_attention_with_sink(
     for subset_lse in subset_lses:
         merge_max = torch.maximum(merge_max, subset_lse)
 
+    safe_merge_max = torch.where(
+        torch.isfinite(merge_max), merge_max, torch.zeros_like(merge_max)
+    )
     merged_acc = torch.zeros_like(subset_outputs[0], dtype=torch.float32)
-    merged_denom = torch.exp(sink - merge_max)
+    sink_weight = torch.exp(sink - safe_merge_max)
+    sink_weight = torch.nan_to_num(sink_weight)
+    merged_denom = sink_weight
     for subset_output, subset_lse in zip(subset_outputs, subset_lses):
-        subset_weight = torch.exp(subset_lse - merge_max)
+        subset_weight = torch.exp(subset_lse - safe_merge_max)
         subset_weight = torch.nan_to_num(subset_weight)
         merged_acc = merged_acc + subset_output.float() * subset_weight[:, :, None]
         merged_denom = merged_denom + subset_weight
 
-    reference_output = merged_acc / merged_denom[:, :, None]
+    safe_denom = torch.where(
+        merged_denom > 0, merged_denom, torch.ones_like(merged_denom)
+    )
+    reference_output = merged_acc / safe_denom[:, :, None]
+    reference_output = torch.where(
+        (merged_denom > 0)[:, :, None],
+        reference_output,
+        torch.zeros((), dtype=reference_output.dtype, device=reference_output.device),
+    )
     output.copy_(reference_output.to(dtype=output.dtype))
 
 
