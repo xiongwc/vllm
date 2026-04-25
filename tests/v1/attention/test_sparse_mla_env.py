@@ -87,7 +87,7 @@ def test_sparse_mla_chunk_env_defaults_invalid_values() -> None:
         VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE="invalid",
         VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE="-7",
     ):
-        assert sparse_mla_reference_topk_chunk_size() == 256
+        assert sparse_mla_reference_topk_chunk_size() == 512
         assert sparse_mla_reference_query_chunk_size() == 1
 
 
