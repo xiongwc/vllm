@@ -71,7 +71,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     sparse_mla_reference_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
-    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
     accumulate_indexed_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
@@ -906,7 +906,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_slot_ids = topk_indices[:, 0, :]
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
-            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
                 q=q,
                 k_cache=compressed_k_cache,
                 slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
@@ -917,6 +917,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 max_score=comp_max_score,
                 denom=comp_denom,
                 acc=comp_output,
+                head_block_size=4,
             )
         finish_gathered_sparse_mla_attention(
             comp_max_score,
