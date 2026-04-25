@@ -187,13 +187,19 @@ def test_finish_with_sink_matches_finish_then_merge_reference() -> None:
     max_score[1, 2] = float("-inf")
     acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
     sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
-    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    output = torch.full((4, 5, 17), -7.0, device="cuda", dtype=torch.bfloat16)
 
     finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, output)
 
     subset_output, subset_lse = _finish_state(max_score, denom, acc)
     expected = _golden_merge_with_sink([subset_output], [subset_lse], sink)
-    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output[:, :3].float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        output[:, 3:].float(),
+        torch.full_like(output[:, 3:].float(), -7.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
@@ -216,7 +222,7 @@ def test_finish_two_states_with_sink_matches_finish_then_merge_reference() -> No
     swa_denom[3, 2] = 0.0
     swa_max[3, 2] = float("-inf")
 
-    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    output = torch.full((4, 5, 17), -7.0, device="cuda", dtype=torch.bfloat16)
     finish_two_sparse_mla_attention_states_with_sink(
         comp_max,
         comp_denom,
@@ -233,7 +239,13 @@ def test_finish_two_states_with_sink_matches_finish_then_merge_reference() -> No
     expected = _golden_merge_with_sink(
         [comp_output, swa_output], [comp_lse, swa_lse], sink
     )
-    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(output[:, :3].float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        output[:, 3:].float(),
+        torch.full_like(output[:, 3:].float(), -7.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
