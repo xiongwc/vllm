@@ -56,7 +56,6 @@ _TOKEN_DATA_SIZE = _FP8_DIM + _ROPE_DIM * 2
 
 def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
-    monkeypatch.delenv("VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE", raising=False)
 
     assert sparse_mla_reference_topk_chunk_size() == 512
 
@@ -1541,62 +1540,11 @@ def test_chunked_reference_accumulation_matches_one_shot(chunk_size: int) -> Non
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
 
-def test_triton_sparse_mla_fallback_disables_cudagraph_support(monkeypatch) -> None:
+def test_triton_sparse_mla_fallback_allows_cudagraph_support_by_default(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", raising=False)
-
-    mla_spec = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.uint8,
-        cache_dtype_str="fp8_ds_mla",
-        alignment=576,
-        compress_ratio=4,
-        model_version="deepseek_v4",
-    )
-    swa_spec = SlidingWindowMLASpec(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.uint8,
-        sliding_window=128,
-        cache_dtype_str="fp8_ds_mla",
-        alignment=576,
-        model_version="deepseek_v4",
-    )
-
-    assert FlashMLASparseMetadataBuilder.get_cudagraph_support(None, mla_spec) is (
-        AttentionCGSupport.NEVER
-    )
-    assert DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(None, swa_spec) is (
-        AttentionCGSupport.NEVER
-    )
-
-    vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            mode=CompilationMode.VLLM_COMPILE,
-            compile_sizes=[1, 2],
-            compile_ranges_endpoints=[8192],
-            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
-            cudagraph_capture_sizes=[1, 2, 4],
-            max_cudagraph_capture_size=4,
-        )
-    )
-    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
-
-    assert vllm_config.compilation_config.mode == CompilationMode.NONE
-    assert vllm_config.compilation_config.compile_sizes == []
-    assert vllm_config.compilation_config.compile_ranges_endpoints == []
-    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-    assert vllm_config.compilation_config.cudagraph_capture_sizes == []
-    assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
-
-
-
-def test_triton_sparse_mla_fallback_can_allow_cudagraphs(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
-    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "1")
 
     mla_spec = MLAAttentionSpec(
         block_size=256,
@@ -1647,3 +1595,56 @@ def test_triton_sparse_mla_fallback_can_allow_cudagraphs(monkeypatch) -> None:
     )
     assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4]
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
+
+
+
+def test_triton_sparse_mla_fallback_can_disable_cudagraphs(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "0")
+
+    mla_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+        cache_dtype_str="fp8_ds_mla",
+        alignment=576,
+        model_version="deepseek_v4",
+    )
+
+    assert FlashMLASparseMetadataBuilder.get_cudagraph_support(None, mla_spec) is (
+        AttentionCGSupport.NEVER
+    )
+    assert DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(None, swa_spec) is (
+        AttentionCGSupport.NEVER
+    )
+
+    vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.VLLM_COMPILE,
+            compile_sizes=[1, 2],
+            compile_ranges_endpoints=[8192],
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_capture_sizes=[1, 2, 4],
+            max_cudagraph_capture_size=4,
+        )
+    )
+    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.NONE
+    assert vllm_config.compilation_config.compile_sizes == []
+    assert vllm_config.compilation_config.compile_ranges_endpoints == []
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == []
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
