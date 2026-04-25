@@ -10,6 +10,7 @@ from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
     calc_diff,
     fp8_fp4_mqa_logits,
+    fp8_mqa_logits,
     fp8_paged_mqa_logits,
     get_num_sms,
     get_paged_mqa_logits_metadata,
@@ -88,6 +89,53 @@ def _ref_fp8_mqa_logits(
     logits = logits.masked_fill(~mask, float("-inf"))
 
     return logits
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_mqa_logits_reference_fallback():
+    torch.manual_seed(0)
+
+    seq_len, seq_len_kv, num_heads, head_dim = 9, 17, 32, 32
+    q = torch.randn(
+        seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = (torch.arange(seq_len, device="cuda", dtype=torch.int32) % 3)
+    cu_seqlen_ke = torch.minimum(
+        torch.arange(seq_len, device="cuda", dtype=torch.int32) + 4,
+        torch.full((seq_len,), seq_len_kv, device="cuda", dtype=torch.int32),
+    )
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_amax = kv.abs().float().amax(dim=1, keepdim=True).clamp(1e-4)
+    kv_scale = (kv_amax / 448.0).squeeze(1).contiguous()
+    kv_fp8 = (kv * (1.0 / kv_scale[:, None])).to(torch.float8_e4m3fn)
+
+    logits = fp8_fp4_mqa_logits(
+        (q_fp8, None),
+        (kv_fp8, kv_scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=True,
+    )
+
+    kv_dequant = kv_fp8.float() * kv_scale[:, None]
+    score = torch.einsum("mhd,nd->hmn", q_fp8.float(), kv_dequant)
+    ref_logits = (score.relu() * weights.transpose(0, 1).unsqueeze(-1)).sum(dim=0)
+    offsets = torch.arange(seq_len_kv, device="cuda")
+    valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+        offsets[None, :] < cu_seqlen_ke[:, None]
+    )
+    ref_logits = ref_logits.masked_fill(~valid, float("-inf"))
+
+    assert torch.equal(torch.isneginf(logits), torch.isneginf(ref_logits))
+    finite = torch.isfinite(ref_logits)
+    assert (logits[finite] - ref_logits[finite]).abs().max() < 1e-4
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
