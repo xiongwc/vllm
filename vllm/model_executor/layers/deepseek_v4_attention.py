@@ -71,10 +71,12 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     sparse_mla_reference_query_chunk_size,
     sparse_mla_reference_topk_chunk_size,
 )
+from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    merge_two_sparse_mla_subsets_with_sink,
+)
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     accumulate_reference_attention_chunk,
     finish_reference_attention_no_sink,
-    merge_reference_attention_with_sink,
     new_reference_attention_state,
     reference_sparse_mla_prefill,
     sink_aware_reference_attention,
@@ -940,9 +942,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             swa_denom,
             swa_acc,
         )
-        merge_reference_attention_with_sink(
-            subset_outputs=[comp_output, swa_output],
-            subset_lses=[comp_lse, swa_lse],
+        merge_two_sparse_mla_subsets_with_sink(
+            subset0_output=comp_output,
+            subset0_lse=comp_lse,
+            subset1_output=swa_output,
+            subset1_lse=swa_lse,
             attn_sink=self.attn_sink,
             output=output,
         )

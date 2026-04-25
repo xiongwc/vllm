@@ -5,6 +5,9 @@
 import pytest
 import torch
 
+from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    merge_two_sparse_mla_subsets_with_sink,
+)
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     accumulate_reference_attention_chunk,
     finish_reference_attention_no_sink,
@@ -254,6 +257,37 @@ def test_lse_merge_with_sink_matches_concatenated_attention() -> None:
     )
     torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-6)
     assert torch.equal(output[3], torch.zeros_like(output[3]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_lse_merge_with_sink_matches_reference() -> None:
+    torch.manual_seed(5)
+    comp_output = torch.randn(3, 4, 9, device="cuda", dtype=torch.float32)
+    swa_output = torch.randn(3, 4, 9, device="cuda", dtype=torch.float32)
+    comp_lse = torch.randn(3, 4, device="cuda", dtype=torch.float32)
+    swa_lse = torch.randn(3, 4, device="cuda", dtype=torch.float32)
+    comp_lse[1, 2] = float("-inf")
+    swa_lse[2, 1] = float("-inf")
+    sink = torch.tensor([-0.5, 0.25, 1.0, -1.5], device="cuda")
+
+    output = torch.empty(3, 4, 9, device="cuda", dtype=torch.bfloat16)
+    expected = torch.empty_like(output)
+    merge_two_sparse_mla_subsets_with_sink(
+        subset0_output=comp_output,
+        subset0_lse=comp_lse,
+        subset1_output=swa_output,
+        subset1_lse=swa_lse,
+        attn_sink=sink,
+        output=output,
+    )
+    merge_reference_attention_with_sink(
+        subset_outputs=[comp_output, swa_output],
+        subset_lses=[comp_lse, swa_lse],
+        attn_sink=sink,
+        output=expected,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
