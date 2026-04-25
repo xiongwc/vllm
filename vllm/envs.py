@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str = ""
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int | None = None
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = False
     VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION: bool = False
     VLLM_SM120_ATTENTION_DUMP_PATH: str = ""
     VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION: bool = False
@@ -1297,6 +1298,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
         os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH": lambda: (
+        os.getenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "").lower()
+        in ("1", "true", "yes", "on")
     ),
     # Legacy names kept as aliases for the SM120 prototype scripts.
     "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION": lambda: (
