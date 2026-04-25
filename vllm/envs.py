@@ -164,6 +164,11 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION: bool = False
+    VLLM_SM120_ATTENTION_DUMP_PATH: str = ""
+    VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION: bool = False
+    VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE: int | None = None
+    VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE: int | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1242,6 +1247,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Experimental DeepSeek V4 SM120 reference attention controls.
+    "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION": lambda: (
+        os.getenv("VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_SM120_ATTENTION_DUMP_PATH": lambda: os.getenv(
+        "VLLM_SM120_ATTENTION_DUMP_PATH", ""
+    ),
+    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION": lambda: (
+        os.getenv("VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE")
+    ),
+    "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
