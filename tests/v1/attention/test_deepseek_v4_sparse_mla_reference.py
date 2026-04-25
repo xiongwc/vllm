@@ -5,8 +5,13 @@
 import pytest
 import torch
 
-from vllm.model_executor.layers.deepseek_v4_attention import (
-    DeepseekV4MLAAttention,
+from vllm.v1.attention.backends.mla.sparse_mla_reference import (
+    accumulate_reference_attention_chunk,
+    finish_reference_attention_no_sink,
+    merge_reference_attention_with_sink,
+    new_reference_attention_state,
+    reference_attention_no_sink,
+    sink_aware_reference_attention,
 )
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
 
@@ -15,16 +20,6 @@ _FP8_DIM = 448
 _ROPE_DIM = 64
 _SCALE_DIM = 8
 _TOKEN_DATA_SIZE = _FP8_DIM + _ROPE_DIM * 2
-
-
-def _make_reference_attention(
-    scale: float,
-    attn_sink: torch.Tensor,
-) -> DeepseekV4MLAAttention:
-    attn = DeepseekV4MLAAttention.__new__(DeepseekV4MLAAttention)
-    attn.scale = scale
-    attn.attn_sink = attn_sink
-    return attn
 
 
 def _masked_scores(
@@ -91,24 +86,25 @@ def _golden_sink_attention(
 
 
 def _chunked_no_sink_attention(
-    attn: DeepseekV4MLAAttention,
     q: torch.Tensor,
     kv: torch.Tensor,
     valid_tokens: torch.Tensor,
+    scale: float,
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q_bhd, max_score, denom, acc = attn._new_reference_attention_state(q)
+    q_bhd, max_score, denom, acc = new_reference_attention_state(q)
     for chunk_start in range(0, kv.shape[1], chunk_size):
         chunk_end = min(chunk_start + chunk_size, kv.shape[1])
-        max_score, denom, acc = attn._accumulate_reference_attention_chunk(
+        max_score, denom, acc = accumulate_reference_attention_chunk(
             q_bhd=q_bhd,
             kv=kv[:, chunk_start:chunk_end],
             valid_tokens=valid_tokens[:, chunk_start:chunk_end],
             max_score=max_score,
             denom=denom,
             acc=acc,
+            scale=scale,
         )
-    return attn._finish_reference_attention_no_sink(max_score, denom, acc)
+    return finish_reference_attention_no_sink(max_score, denom, acc)
 
 
 def _write_fp8_ds_mla_token(
@@ -173,9 +169,7 @@ def test_reference_attention_no_sink_matches_logsumexp() -> None:
         ],
         dtype=torch.bool,
     )
-    attn = _make_reference_attention(scale, torch.randn(4))
-
-    output, lse = attn._reference_attention_no_sink(q, kv, valid_tokens)
+    output, lse = reference_attention_no_sink(q, kv, valid_tokens, scale)
     expected_output, expected_lse = _golden_no_sink_attention(
         q,
         kv,
@@ -202,9 +196,7 @@ def test_sink_aware_reference_attention_matches_dense_golden() -> None:
     )
     sink = torch.tensor([-1.0, 0.25, 1.5, -0.5])
     output = torch.empty(3, 4, 5)
-    attn = _make_reference_attention(scale, sink)
-
-    attn._sink_aware_reference_attention(q, kv, valid_tokens, output)
+    sink_aware_reference_attention(q, kv, valid_tokens, scale, sink, output)
     expected = _golden_sink_attention(q, kv, valid_tokens, scale, sink)
 
     torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-6)
@@ -238,17 +230,17 @@ def test_lse_merge_with_sink_matches_concatenated_attention() -> None:
     )
     sink = torch.tensor([-0.25, 0.75, 1.25])
     output = torch.empty(4, 3, 7)
-    attn = _make_reference_attention(scale, sink)
-
-    comp_output, comp_lse = attn._reference_attention_no_sink(
+    comp_output, comp_lse = reference_attention_no_sink(
         q,
         compressed_kv,
         compressed_valid,
+        scale,
     )
-    swa_output, swa_lse = attn._reference_attention_no_sink(q, swa_kv, swa_valid)
-    attn._merge_reference_attention_with_sink(
+    swa_output, swa_lse = reference_attention_no_sink(q, swa_kv, swa_valid, scale)
+    merge_reference_attention_with_sink(
         subset_outputs=[comp_output, swa_output],
         subset_lses=[comp_lse, swa_lse],
+        attn_sink=sink,
         output=output,
     )
 
@@ -328,13 +320,11 @@ def test_chunked_reference_accumulation_matches_one_shot(chunk_size: int) -> Non
         ],
         dtype=torch.bool,
     )
-    attn = _make_reference_attention(scale, torch.randn(2))
-
     output, lse = _chunked_no_sink_attention(
-        attn,
         q,
         kv,
         valid_tokens,
+        scale,
         chunk_size,
     )
     expected_output, expected_lse = _golden_no_sink_attention(
