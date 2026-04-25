@@ -19,8 +19,8 @@ else()
   # This ref should be kept in sync with tools/install_deepgemm.sh
   FetchContent_Declare(
     deepgemm
-    GIT_REPOSITORY https://github.com/jasl/DeepGEMM.git
-    GIT_TAG 959f1df759ed591cadb463ab9af68222428de5df
+    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
+    GIT_TAG 7f2a703ed51ac1f7af07f5e1453b2d3267d37d50
     GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
