@@ -213,6 +213,11 @@ def _lazy_init() -> None:
             envs.VLLM_CACHE_ROOT, "deep_gemm"
         )
 
+    if (
+        current_platform.is_device_capability_family(120)
+        and envs.VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED
+    ):
+        os.environ.setdefault("DG_SM120_PAGED_MQA_TILED", "1")
     _dg = _import_deep_gemm()
     if _dg is None:
         return
