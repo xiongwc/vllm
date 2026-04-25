@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    accumulate_gathered_sparse_mla_attention_chunk,
+    finish_gathered_sparse_mla_attention,
     merge_two_sparse_mla_subsets_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
@@ -288,6 +290,116 @@ def test_triton_lse_merge_with_sink_matches_reference() -> None:
     )
 
     torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("head_dim", [16, 512])
+def test_triton_gathered_attention_chunk_matches_reference(head_dim: int) -> None:
+    torch.manual_seed(6)
+    scale = 0.125
+    q = torch.randn(2, 1, 3, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(2, 5, head_dim, device="cuda", dtype=torch.bfloat16)
+    slot_ids = torch.tensor(
+        [
+            [0, 1, -1, 3, 4],
+            [5, -1, 7, 8, -1],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    max_score = torch.full((2, 3), float("-inf"), device="cuda")
+    denom = torch.zeros((2, 3), device="cuda")
+    acc = torch.zeros((2, 3, head_dim), device="cuda")
+
+    accumulate_gathered_sparse_mla_attention_chunk(
+        q=q,
+        kv=kv[:, :2],
+        slot_ids=slot_ids[:, :2],
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+    accumulate_gathered_sparse_mla_attention_chunk(
+        q=q,
+        kv=kv[:, 2:],
+        slot_ids=slot_ids[:, 2:],
+        lens=lens,
+        candidate_offset=2,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+
+    output = torch.empty_like(acc)
+    lse = torch.empty_like(max_score)
+    finish_gathered_sparse_mla_attention(
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        output=output,
+        lse=lse,
+    )
+
+    offsets = torch.arange(slot_ids.shape[1], device="cuda")
+    valid_tokens = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
+    expected_output, expected_lse = reference_attention_no_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+    )
+    torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_gathered_attention_chunk_matches_reference_without_slot_ids() -> None:
+    torch.manual_seed(8)
+    scale = 0.2
+    q = torch.randn(3, 1, 2, 32, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(3, 6, 32, device="cuda", dtype=torch.bfloat16)
+    lens = torch.tensor([6, 3, 0], dtype=torch.int32, device="cuda")
+    max_score = torch.full((3, 2), float("-inf"), device="cuda")
+    denom = torch.zeros((3, 2), device="cuda")
+    acc = torch.zeros((3, 2, 32), device="cuda")
+
+    accumulate_gathered_sparse_mla_attention_chunk(
+        q=q,
+        kv=kv,
+        slot_ids=None,
+        lens=lens,
+        candidate_offset=0,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+
+    output = torch.empty_like(acc)
+    lse = torch.empty_like(max_score)
+    finish_gathered_sparse_mla_attention(
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        output=output,
+        lse=lse,
+    )
+
+    offsets = torch.arange(kv.shape[1], device="cuda")
+    valid_tokens = offsets[None, :] < lens[:, None]
+    expected_output, expected_lse = reference_attention_no_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+    )
+    torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")

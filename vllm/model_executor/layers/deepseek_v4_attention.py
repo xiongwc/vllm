@@ -72,12 +72,11 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     sparse_mla_reference_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    accumulate_gathered_sparse_mla_attention_chunk,
+    finish_gathered_sparse_mla_attention,
     merge_two_sparse_mla_subsets_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
-    accumulate_reference_attention_chunk,
-    finish_reference_attention_no_sink,
-    new_reference_attention_state,
     reference_sparse_mla_prefill,
     sink_aware_reference_attention,
 )
@@ -871,16 +870,38 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compressed_topk,
             sparse_mla_reference_topk_chunk_size(),
         )
-        (compressed_kv, swa_kv) = current_workspace_manager().get_simultaneous(
+        (
+            compressed_kv,
+            swa_kv,
+            comp_max_score,
+            comp_denom,
+            comp_output,
+            comp_lse,
+            swa_max_score,
+            swa_denom,
+            swa_output,
+            swa_lse,
+        ) = current_workspace_manager().get_simultaneous(
             ((num_decode_tokens, topk_chunk_size, q.shape[-1]), torch.bfloat16),
             ((num_decode_tokens, max_swa_len, q.shape[-1]), torch.bfloat16),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
         )
         swa_kv.zero_()
+        comp_max_score.fill_(float("-inf"))
+        comp_denom.zero_()
+        comp_output.zero_()
+        swa_max_score.fill_(float("-inf"))
+        swa_denom.zero_()
+        swa_output.zero_()
 
         compressed_slot_ids = topk_indices[:, 0, :]
-        q_bhd, comp_max_score, comp_denom, comp_acc = (
-            new_reference_attention_state(q)
-        )
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
             chunk_size = chunk_end - chunk_start
@@ -893,34 +914,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_chunk,
                 block_size=compressed_block_size,
             )
-
-            chunk_offsets = torch.arange(
-                chunk_start,
-                chunk_end,
-                device=q.device,
+            accumulate_gathered_sparse_mla_attention_chunk(
+                q=q,
+                kv=compressed_kv_chunk,
+                slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
+                lens=topk_lens,
+                candidate_offset=chunk_start,
+                scale=self.scale,
+                max_score=comp_max_score,
+                denom=comp_denom,
+                acc=comp_output,
             )
-            compressed_valid = (
-                (chunk_offsets[None, :] < topk_lens[:, None])
-                & (compressed_slot_ids[:, chunk_start:chunk_end] >= 0)
-            )
-            comp_max_score, comp_denom, comp_acc = (
-                accumulate_reference_attention_chunk(
-                    q_bhd=q_bhd,
-                    kv=compressed_kv_chunk,
-                    valid_tokens=compressed_valid,
-                    max_score=comp_max_score,
-                    denom=comp_denom,
-                    acc=comp_acc,
-                    scale=self.scale,
-                )
-            )
-        comp_output, comp_lse = finish_reference_attention_no_sink(
+        finish_gathered_sparse_mla_attention(
             comp_max_score,
             comp_denom,
-            comp_acc,
+            comp_output,
+            comp_output,
+            comp_lse,
         )
 
-        _, swa_max_score, swa_denom, swa_acc = new_reference_attention_state(q)
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         dequantize_and_gather_k_cache(
             swa_kv,
@@ -931,23 +943,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             block_size=swa_metadata.block_size,
             offset=0,
         )
-        swa_offsets = torch.arange(max_swa_len, device=q.device)
-        swa_valid = swa_offsets[None, :] < swa_lens[:, None]
-        swa_max_score, swa_denom, swa_acc = (
-            accumulate_reference_attention_chunk(
-                q_bhd=q_bhd,
-                kv=swa_kv,
-                valid_tokens=swa_valid,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
-                scale=self.scale,
-            )
+        accumulate_gathered_sparse_mla_attention_chunk(
+            q=q,
+            kv=swa_kv,
+            slot_ids=None,
+            lens=swa_lens,
+            candidate_offset=0,
+            scale=self.scale,
+            max_score=swa_max_score,
+            denom=swa_denom,
+            acc=swa_output,
         )
-        swa_output, swa_lse = finish_reference_attention_no_sink(
+        finish_gathered_sparse_mla_attention(
             swa_max_score,
             swa_denom,
-            swa_acc,
+            swa_output,
+            swa_output,
+            swa_lse,
         )
         merge_two_sparse_mla_subsets_with_sink(
             subset0_output=comp_output,
