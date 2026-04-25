@@ -124,6 +124,96 @@ def merge_two_sparse_mla_subsets_with_sink(
 
 
 @triton.jit
+def _merge_single_subset_with_sink_kernel(
+    subset_output_ptr,
+    subset_lse_ptr,
+    sink_ptr,
+    output_ptr,
+    stride_subset_t: tl.constexpr,
+    stride_subset_h: tl.constexpr,
+    stride_subset_d: tl.constexpr,
+    stride_lse_t: tl.constexpr,
+    stride_lse_h: tl.constexpr,
+    stride_output_t: tl.constexpr,
+    stride_output_h: tl.constexpr,
+    stride_output_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_head = tl.program_id(0)
+    block_d = tl.program_id(1)
+    token_idx = token_head // num_heads
+    head_idx = token_head - token_idx * num_heads
+    offsets = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask = offsets < head_dim
+
+    subset_lse = tl.load(
+        subset_lse_ptr + token_idx * stride_lse_t + head_idx * stride_lse_h
+    )
+    sink = tl.load(sink_ptr + head_idx)
+    merge_max = tl.maximum(subset_lse, sink)
+
+    subset_weight = tl.exp(subset_lse - merge_max)
+    sink_weight = tl.exp(sink - merge_max)
+    denom = subset_weight + sink_weight
+    subset_output = tl.load(
+        subset_output_ptr
+        + token_idx * stride_subset_t
+        + head_idx * stride_subset_h
+        + offsets * stride_subset_d,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    merged = subset_output * subset_weight / denom
+    tl.store(
+        output_ptr
+        + token_idx * stride_output_t
+        + head_idx * stride_output_h
+        + offsets * stride_output_d,
+        merged,
+        mask=mask,
+    )
+
+
+def merge_sparse_mla_subset_with_sink(
+    subset_output: torch.Tensor,
+    subset_lse: torch.Tensor,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    assert subset_output.shape == output.shape
+    assert subset_lse.shape == subset_output.shape[:2]
+    assert attn_sink.shape[0] == subset_output.shape[1]
+    assert subset_output.is_cuda
+    assert subset_lse.is_cuda
+    assert attn_sink.is_cuda
+    assert output.is_cuda
+
+    num_tokens, num_heads, head_dim = subset_output.shape
+    block_d = min(128, triton.next_power_of_2(head_dim))
+    grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
+    _merge_single_subset_with_sink_kernel[grid](
+        subset_output,
+        subset_lse,
+        attn_sink,
+        output,
+        subset_output.stride(0),
+        subset_output.stride(1),
+        subset_output.stride(2),
+        subset_lse.stride(0),
+        subset_lse.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        num_heads,
+        head_dim,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _accumulate_gathered_attention_chunk_kernel(
     q_ptr,
     kv_ptr,

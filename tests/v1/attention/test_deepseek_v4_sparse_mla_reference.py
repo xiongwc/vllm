@@ -10,6 +10,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
     accumulate_gathered_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
+    merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
@@ -287,6 +288,32 @@ def test_triton_lse_merge_with_sink_matches_reference() -> None:
     merge_reference_attention_with_sink(
         subset_outputs=[comp_output, swa_output],
         subset_lses=[comp_lse, swa_lse],
+        attn_sink=sink,
+        output=expected,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_single_lse_merge_with_sink_matches_reference() -> None:
+    torch.manual_seed(14)
+    subset_output = torch.randn(3, 4, 9, device="cuda", dtype=torch.float32)
+    subset_lse = torch.randn(3, 4, device="cuda", dtype=torch.float32)
+    subset_lse[1, 2] = float("-inf")
+    sink = torch.tensor([-0.5, 0.25, 1.0, -1.5], device="cuda")
+
+    output = torch.empty(3, 4, 9, device="cuda", dtype=torch.bfloat16)
+    expected = torch.empty_like(output)
+    merge_sparse_mla_subset_with_sink(
+        subset_output=subset_output,
+        subset_lse=subset_lse,
+        attn_sink=sink,
+        output=output,
+    )
+    merge_reference_attention_with_sink(
+        subset_outputs=[subset_output],
+        subset_lses=[subset_lse],
         attn_sink=sink,
         output=expected,
     )
@@ -633,6 +660,77 @@ def test_triton_fp8ds_paged_attention_chunk_matches_reference() -> None:
 
     torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_fp8ds_paged_attention_with_sink_matches_reference() -> None:
+    torch.manual_seed(15)
+    block_size = 4
+    k_cache = torch.zeros(
+        3,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_table = torch.tensor([[1, 0, 2]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([4], dtype=torch.int32, device="cuda")
+    q = torch.randn(1, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.tensor([-0.25, 0.5, 1.25], device="cuda")
+    scale = 0.0625
+
+    gathered = torch.zeros(1, 4, 512, device="cuda", dtype=torch.bfloat16)
+    expected_by_slot: dict[int, torch.Tensor] = {}
+    start_pos = int(seq_lens[0].item() - gather_lens[0].item())
+    for gather_idx in range(int(gather_lens[0].item())):
+        pos = start_pos + gather_idx
+        physical_block = int(block_table[0, pos // block_size].item())
+        slot = physical_block * block_size + pos % block_size
+        expected_by_slot.setdefault(
+            slot,
+            _write_fp8_ds_mla_token(k_cache, slot, block_size),
+        )
+        gathered[0, gather_idx] = expected_by_slot[slot]
+
+    max_score = torch.full((1, 3), float("-inf"), device="cuda")
+    denom = torch.zeros((1, 3), device="cuda")
+    acc = torch.zeros((1, 3, 512), device="cuda")
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=4,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+    )
+    subset_output = torch.empty_like(acc)
+    subset_lse = torch.empty_like(max_score)
+    finish_gathered_sparse_mla_attention(
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        output=subset_output,
+        lse=subset_lse,
+    )
+
+    output = torch.empty(1, 3, 512, device="cuda", dtype=torch.bfloat16)
+    merge_sparse_mla_subset_with_sink(
+        subset_output=subset_output,
+        subset_lse=subset_lse,
+        attn_sink=sink,
+        output=output,
+    )
+    valid_tokens = torch.ones(1, 4, device="cuda", dtype=torch.bool)
+    expected = _golden_sink_attention(q, gathered, valid_tokens, scale, sink)
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(

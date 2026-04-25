@@ -73,13 +73,12 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
-    accumulate_gathered_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
+    merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     reference_sparse_mla_prefill,
-    sink_aware_reference_attention,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -808,27 +807,44 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
-        (gathered_kv,) = current_workspace_manager().get_simultaneous(
-            ((num_decode_tokens, max_swa_len, q.shape[-1]), torch.bfloat16),
+        (
+            swa_max_score,
+            swa_denom,
+            swa_output,
+            swa_lse,
+        ) = current_workspace_manager().get_simultaneous(
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
+            ((num_decode_tokens, self.num_heads, q.shape[-1]), torch.float32),
+            ((num_decode_tokens, self.num_heads), torch.float32),
         )
-        gathered_kv.zero_()
-        dequantize_and_gather_k_cache(
-            gathered_kv,
-            swa_k_cache,
+        swa_max_score.fill_(float("-inf"))
+        swa_denom.zero_()
+        swa_output.zero_()
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+            q=q,
+            k_cache=swa_k_cache,
             seq_lens=swa_metadata.seq_lens[:num_decodes],
             gather_lens=swa_lens,
             block_table=swa_metadata.block_table[:num_decodes],
             block_size=swa_metadata.block_size,
-            offset=0,
-        )
-
-        token_offsets = torch.arange(max_swa_len, device=q.device)
-        valid_tokens = token_offsets[None, :] < swa_lens[:, None]
-        sink_aware_reference_attention(
-            q=q,
-            kv=gathered_kv,
-            valid_tokens=valid_tokens,
+            candidate_offset=0,
+            num_candidates=max_swa_len,
             scale=self.scale,
+            max_score=swa_max_score,
+            denom=swa_denom,
+            acc=swa_output,
+        )
+        finish_gathered_sparse_mla_attention(
+            swa_max_score,
+            swa_denom,
+            swa_output,
+            swa_output,
+            swa_lse,
+        )
+        merge_sparse_mla_subset_with_sink(
+            subset_output=swa_output,
+            subset_lse=swa_lse,
             attn_sink=self.attn_sink,
             output=output,
         )
