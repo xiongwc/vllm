@@ -7,6 +7,7 @@ import torch
 
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
     accumulate_gathered_sparse_mla_attention_chunk,
     accumulate_indexed_sparse_mla_attention_chunk,
@@ -337,6 +338,77 @@ def test_fp8ds_global_slot_attention_chunks_match_reference() -> None:
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
         q, k_cache, slot_ids[:, 2:], lens, block_size, scale,
         max_score, denom, acc, candidate_offset=2
+    )
+    output, lse = _finish_state(max_score, denom, acc)
+
+    gathered = torch.zeros(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    for token_idx in range(slot_ids.shape[0]):
+        for topk_idx in range(slot_ids.shape[1]):
+            slot = int(slot_ids[token_idx, topk_idx].item())
+            if slot >= 0:
+                gathered[token_idx, topk_idx] = expected_by_slot[slot]
+    offsets = torch.arange(slot_ids.shape[1], device="cuda")
+    valid = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
+    expected_output, expected_lse = _golden_no_sink_attention(q, gathered, valid, scale)
+    torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("head_block_size", [2, 4])
+def test_fp8ds_global_slot_multihead_attention_matches_reference(
+    head_block_size: int,
+) -> None:
+    torch.manual_seed(8)
+    block_size = 4
+    k_cache = torch.zeros(
+        3,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_by_slot = {
+        slot: _write_fp8_ds_mla_token(k_cache, slot, block_size)
+        for slot in (0, 1, 3, 4, 7, 8)
+    }
+    slot_ids = torch.tensor(
+        [[0, 3, -1, 8, 1], [7, -1, 4, 0, 8]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    scale = 0.0625
+    max_score = torch.full((2, 5), float("-inf"), device="cuda")
+    denom = torch.zeros((2, 5), device="cuda")
+    acc = torch.zeros((2, 5, 512), device="cuda")
+
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q,
+        k_cache,
+        slot_ids[:, :2],
+        lens,
+        block_size,
+        scale,
+        max_score,
+        denom,
+        acc,
+        candidate_offset=0,
+        head_block_size=head_block_size,
+    )
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q,
+        k_cache,
+        slot_ids[:, 2:],
+        lens,
+        block_size,
+        scale,
+        max_score,
+        denom,
+        acc,
+        candidate_offset=2,
+        head_block_size=head_block_size,
     )
     output, lse = _finish_state(max_score, denom, acc)
 
