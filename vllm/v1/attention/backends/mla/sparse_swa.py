@@ -31,29 +31,47 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
-_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
-_SM120_REFERENCE_ATTENTION_ENV = "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
+_TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
+_TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
+_LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
+_LEGACY_SM120_REFERENCE_ATTENTION_ENV = (
+    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
+)
+_ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
+_ENV_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
-def _is_sm120_attention_dump_enabled() -> bool:
-    return os.getenv(_SM120_ATTENTION_DUMP_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _optional_env_flag(name: str) -> bool | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    value = raw_value.lower()
+    if value in _ENV_TRUE_VALUES:
+        return True
+    if value in _ENV_FALSE_VALUES:
+        return False
+    return None
 
 
-def _is_sm120_reference_attention_enabled() -> bool:
-    return os.getenv(_SM120_REFERENCE_ATTENTION_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _is_sparse_mla_attention_dump_enabled() -> bool:
+    return (
+        _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
+        or _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV)
+        or False
+    )
 
 
-def _is_sm120_device(device: torch.device) -> bool:
+def _is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
+    if configured is not None:
+        return configured
+    legacy_configured = _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
+    if legacy_configured is not None:
+        return legacy_configured
+    return _is_sm12x_device(device)
+
+
+def _is_sm12x_device(device: torch.device) -> bool:
     if not torch.cuda.is_available():
         return False
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -391,11 +409,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         if num_decode_tokens == 0:
             return out
         if (
-            _is_sm120_device(self.device)
-            and (
-                _is_sm120_attention_dump_enabled()
-                or _is_sm120_reference_attention_enabled()
-            )
+            _is_sparse_mla_attention_dump_enabled()
+            or _is_sparse_mla_reference_attention_enabled(self.device)
         ):
             return out
         for layer_type in self._layer_types:
