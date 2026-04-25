@@ -75,33 +75,72 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
-_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
-_SM120_ATTENTION_DUMP_PATH_ENV = "VLLM_SM120_ATTENTION_DUMP_PATH"
-_SM120_REFERENCE_ATTENTION_ENV = "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
-_SM120_REFERENCE_TOPK_CHUNK_ENV = "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE"
-_SM120_REFERENCE_QUERY_CHUNK_ENV = "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE"
+_TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
+_TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
+_TRITON_MLA_SPARSE_DUMP_PATH_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
+_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE"
+_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
+
+_LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
+_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV = "VLLM_SM120_ATTENTION_DUMP_PATH"
+_LEGACY_SM120_REFERENCE_ATTENTION_ENV = (
+    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
+)
+_LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV = "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE"
+_LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV = "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE"
+_ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
+_ENV_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
-def _is_sm120_attention_dump_enabled() -> bool:
-    return os.getenv(_SM120_ATTENTION_DUMP_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _optional_env_flag(name: str) -> bool | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return None
+    value = raw_value.lower()
+    if value in _ENV_TRUE_VALUES:
+        return True
+    if value in _ENV_FALSE_VALUES:
+        return False
+    return None
 
 
-def _is_sm120_reference_attention_enabled() -> bool:
-    return os.getenv(_SM120_REFERENCE_ATTENTION_ENV, "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _is_sm12x_device(device: torch.device) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(index)[0] == 12
 
 
-def _sm120_reference_topk_chunk_size() -> int:
-    raw_value = os.getenv(_SM120_REFERENCE_TOPK_CHUNK_ENV)
+def _is_sparse_mla_attention_dump_enabled() -> bool:
+    return (
+        _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
+        or _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV)
+        or False
+    )
+
+
+def _is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
+    if configured is not None:
+        return configured
+    legacy_configured = _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
+    if legacy_configured is not None:
+        return legacy_configured
+    return _is_sm12x_device(device)
+
+
+def _sparse_mla_attention_dump_path() -> str:
+    return (
+        os.getenv(_TRITON_MLA_SPARSE_DUMP_PATH_ENV)
+        or os.getenv(_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV)
+        or "/tmp/deepseek_v4_triton_mla_sparse_dump.jsonl"
+    )
+
+
+def _sparse_mla_reference_topk_chunk_size() -> int:
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV) or os.getenv(
+        _LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV
+    )
     if raw_value is None:
         return 256
     try:
@@ -110,8 +149,10 @@ def _sm120_reference_topk_chunk_size() -> int:
         return 256
 
 
-def _sm120_reference_query_chunk_size() -> int:
-    raw_value = os.getenv(_SM120_REFERENCE_QUERY_CHUNK_ENV)
+def _sparse_mla_reference_query_chunk_size() -> int:
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV) or os.getenv(
+        _LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV
+    )
     if raw_value is None:
         return 256
     try:
@@ -136,7 +177,7 @@ def _optional_int(value: object) -> int | None:
     return int(value) if value is not None else None
 
 
-def _dump_sm120_attention_state(
+def _dump_sparse_mla_attention_state(
     phase: str,
     prefix: str,
     compress_ratio: int,
@@ -146,10 +187,7 @@ def _dump_sm120_attention_state(
     attn_metadata: FlashMLASparseMetadata | None,
     fields: dict[str, object],
 ) -> None:
-    dump_path = os.getenv(
-        _SM120_ATTENTION_DUMP_PATH_ENV,
-        "/tmp/deepseek_v4_sm120_attention_dump.jsonl",
-    )
+    dump_path = _sparse_mla_attention_dump_path()
     payload = {
         "phase": phase,
         "prefix": prefix,
@@ -214,11 +252,11 @@ def _dump_sm120_attention_state(
     with open(dump_path, "a", encoding="utf-8") as dump_file:
         dump_file.write(json.dumps(payload, sort_keys=True) + "\n")
     raise RuntimeError(
-        f"SM120 DeepseekV4 attention diagnostic dump written to {dump_path}"
+        f"DeepseekV4 sparse MLA diagnostic dump written to {dump_path}"
     )
 
 
-def _write_sm120_attention_state_if_enabled(
+def _write_sparse_mla_attention_state_if_enabled(
     phase: str,
     prefix: str,
     compress_ratio: int,
@@ -228,9 +266,9 @@ def _write_sm120_attention_state_if_enabled(
     attn_metadata: FlashMLASparseMetadata | None,
     fields: dict[str, object],
 ) -> None:
-    if not _is_sm120_attention_dump_enabled():
+    if not _is_sparse_mla_attention_dump_enabled():
         return
-    _dump_sm120_attention_state(
+    _dump_sparse_mla_attention_state(
         phase=phase,
         prefix=prefix,
         compress_ratio=compress_ratio,
@@ -984,7 +1022,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         reference_output = merged_acc / merged_denom[:, :, None]
         output.copy_(reference_output.to(dtype=output.dtype))
 
-    def _forward_sm120_swa_decode_reference(
+    def _forward_sparse_mla_swa_decode_reference(
         self,
         q: torch.Tensor,
         swa_k_cache: torch.Tensor,
@@ -994,7 +1032,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         assert num_decodes == num_decode_tokens, (
-            "SM120 reference SWA decode currently supports one query token per "
+            "Sparse MLA reference SWA decode currently supports one query token per "
             f"request, got {num_decode_tokens=} and {num_decodes=}"
         )
 
@@ -1018,7 +1056,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         valid_tokens = token_offsets[None, :] < swa_lens[:, None]
         self._sink_aware_reference_attention(q, gathered_kv, valid_tokens, output)
 
-    def _forward_sm120_compressed_decode_reference(
+    def _forward_sparse_mla_compressed_decode_reference(
         self,
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor,
@@ -1031,14 +1069,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         if self.compress_ratio not in (4, 128):
             raise NotImplementedError(
-                "SM120 reference compressed decode currently supports "
+                "Sparse MLA reference compressed decode currently supports "
                 f"compress_ratio=4 or 128, got {self.compress_ratio}"
             )
 
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         assert num_decodes == num_decode_tokens, (
-            "SM120 reference compressed decode currently supports one query "
+            "Sparse MLA reference compressed decode currently supports one query "
             f"token per request, got {num_decode_tokens=} and {num_decodes=}"
         )
 
@@ -1047,7 +1085,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_topk = topk_indices.shape[-1]
         topk_chunk_size = min(
             compressed_topk,
-            _sm120_reference_topk_chunk_size(),
+            _sparse_mla_reference_topk_chunk_size(),
         )
         (compressed_kv, swa_kv) = current_workspace_manager().get_simultaneous(
             ((num_decode_tokens, topk_chunk_size, q.shape[-1]), torch.bfloat16),
@@ -1131,7 +1169,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             output=output,
         )
 
-    def _forward_sm120_prefill_reference(
+    def _forward_sparse_mla_prefill_reference(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -1142,9 +1180,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv_flat = kv.reshape(-1, q.shape[-1])
         topk_chunk_size = min(
             combined_indices.shape[-1],
-            _sm120_reference_topk_chunk_size(),
+            _sparse_mla_reference_topk_chunk_size(),
         )
-        query_chunk_size = min(q.shape[0], _sm120_reference_query_chunk_size())
+        query_chunk_size = min(q.shape[0], _sparse_mla_reference_query_chunk_size())
 
         for token_start in range(0, q.shape[0], query_chunk_size):
             token_end = min(token_start + query_chunk_size, q.shape[0])
@@ -1310,7 +1348,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "num_decodes": int(num_decodes),
             "num_decode_tokens": int(num_decode_tokens),
         }
-        _write_sm120_attention_state_if_enabled(
+        _write_sparse_mla_attention_state_if_enabled(
             phase="decode",
             prefix=self.prefix,
             compress_ratio=self.compress_ratio,
@@ -1321,9 +1359,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             fields=decode_fields,
         )
 
-        if _is_sm120_reference_attention_enabled():
+        if _is_sparse_mla_reference_attention_enabled(q.device):
             if swa_only:
-                self._forward_sm120_swa_decode_reference(
+                self._forward_sparse_mla_swa_decode_reference(
                     q=q,
                     swa_k_cache=self.swa_cache_layer.kv_cache,
                     swa_metadata=swa_metadata,
@@ -1335,7 +1373,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 assert topk_indices is not None
                 assert topk_lens is not None
-                self._forward_sm120_compressed_decode_reference(
+                self._forward_sparse_mla_compressed_decode_reference(
                     q=q,
                     compressed_k_cache=compressed_k_cache,
                     swa_k_cache=self.swa_cache_layer.kv_cache,
@@ -1346,7 +1384,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     output=output,
                 )
                 return
-            _dump_sm120_attention_state(
+            _dump_sparse_mla_attention_state(
                 phase="decode_unsupported_compressed",
                 prefix=self.prefix,
                 compress_ratio=self.compress_ratio,
@@ -1505,8 +1543,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 N,
             )
 
-            if _is_sm120_attention_dump_enabled():
-                _dump_sm120_attention_state(
+            if _is_sparse_mla_attention_dump_enabled():
+                _dump_sparse_mla_attention_state(
                     phase="prefill",
                     prefix=self.prefix,
                     compress_ratio=self.compress_ratio,
@@ -1531,8 +1569,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     },
                 )
 
-            if _is_sm120_reference_attention_enabled():
-                self._forward_sm120_prefill_reference(
+            if _is_sparse_mla_reference_attention_enabled(q.device):
+                self._forward_sparse_mla_prefill_reference(
                     q=q[query_start:query_end],
                     kv=kv[:chunk_size],
                     combined_indices=combined_indices,
