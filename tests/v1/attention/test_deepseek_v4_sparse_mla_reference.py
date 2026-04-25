@@ -335,7 +335,7 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
     acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
     sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
 
-    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    output = torch.full((4, 5, 17), -7.0, device="cuda", dtype=torch.bfloat16)
     finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, output)
 
     subset_output = torch.empty_like(acc)
@@ -347,7 +347,7 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
         output=subset_output,
         lse=subset_lse,
     )
-    expected = torch.empty_like(output)
+    expected = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
     merge_reference_attention_with_sink(
         subset_outputs=[subset_output],
         subset_lses=[subset_lse],
@@ -355,7 +355,15 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
         output=expected,
     )
 
-    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        output[:, :3].float(), expected.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        output[:, 3:].float(),
+        torch.full_like(output[:, 3:].float(), -7.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
@@ -378,7 +386,7 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
     swa_denom[3, 2] = 0.0
     swa_max[3, 2] = float("-inf")
 
-    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    output = torch.full((4, 5, 17), -7.0, device="cuda", dtype=torch.bfloat16)
     finish_two_sparse_mla_attention_states_with_sink(
         comp_max,
         comp_denom,
@@ -408,7 +416,7 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
         swa_output,
         swa_lse,
     )
-    expected = torch.empty_like(output)
+    expected = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
     merge_two_sparse_mla_subsets_with_sink(
         subset0_output=comp_output,
         subset0_lse=comp_lse,
@@ -418,7 +426,15 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
         output=expected,
     )
 
-    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        output[:, :3].float(), expected.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        output[:, 3:].float(),
+        torch.full_like(output[:, 3:].float(), -7.0),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
