@@ -30,6 +30,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
+    sparse_mla_decode_head_block_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     accumulate_reference_attention_chunk,
@@ -55,6 +56,20 @@ def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE", raising=False)
 
     assert sparse_mla_reference_topk_chunk_size() == 512
+
+
+@pytest.mark.parametrize(
+    ("num_decode_tokens", "expected_head_block_size"),
+    [(0, 1), (1, 1), (2, 2), (4, 2), (7, 2), (8, 4), (32, 4)],
+)
+def test_triton_sparse_mla_decode_head_block_size(
+    num_decode_tokens: int,
+    expected_head_block_size: int,
+) -> None:
+    assert (
+        sparse_mla_decode_head_block_size(num_decode_tokens)
+        == expected_head_block_size
+    )
 
 
 def _masked_scores(
@@ -1144,7 +1159,10 @@ def test_triton_fp8ds_paged_attention_with_sink_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
-def test_triton_fp8ds_paged_attention_with_sink_direct_matches_state_path() -> None:
+@pytest.mark.parametrize("head_block_size", [1, 2, 4])
+def test_triton_fp8ds_paged_attention_with_sink_direct_matches_state_path(
+    head_block_size: int,
+) -> None:
     torch.manual_seed(29)
     block_size = 4
     k_cache = torch.zeros(
@@ -1207,14 +1225,16 @@ def test_triton_fp8ds_paged_attention_with_sink_direct_matches_state_path() -> N
         scale=scale,
         attn_sink=sink,
         output=actual,
-        head_block_size=1,
+        head_block_size=head_block_size,
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("head_block_size", [1, 2, 4])
 def test_triton_fp8ds_global_paged_attention_with_sink_direct_matches_state_path(
+    head_block_size: int,
 ) -> None:
     torch.manual_seed(31)
     compressed_block_size = 4
@@ -1323,7 +1343,7 @@ def test_triton_fp8ds_global_paged_attention_with_sink_direct_matches_state_path
         scale=scale,
         attn_sink=sink,
         output=actual,
-        head_block_size=1,
+        head_block_size=head_block_size,
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

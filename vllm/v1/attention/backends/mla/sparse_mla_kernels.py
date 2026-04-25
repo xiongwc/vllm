@@ -7,6 +7,21 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
+    """Choose the SM12x sparse MLA head grouping for decode kernels.
+
+    Single-token decode is latency sensitive and does best with one head per
+    program. Once there are enough query tokens, grouping heads lets the kernel
+    reuse each dequantized KV row across multiple heads.
+    """
+
+    if num_decode_tokens <= 1:
+        return 1
+    if num_decode_tokens < 8:
+        return 2
+    return 4
+
+
 @triton.jit
 def _merge_two_subsets_with_sink_kernel(
     out0_ptr,
