@@ -338,6 +338,47 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+def _fp8_mqa_logits_torch_reference(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("SM120 MQA logits fallback only supports FP8 Q")
+
+    k_values, k_scales = kv
+    q_f32 = q_values.to(torch.float32)
+    k_f32 = k_values.to(torch.float32) * k_scales.reshape(-1, 1).to(torch.float32)
+    k_t = k_f32.transpose(0, 1).contiguous()
+
+    seq_len, num_heads, _ = q_f32.shape
+    seq_len_kv = k_f32.shape[0]
+    logits = torch.zeros(
+        (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
+    )
+
+    # Avoid materializing the full [H, M, N] score tensor for all heads.
+    for head_start in range(0, num_heads, 8):
+        head_end = min(head_start + 8, num_heads)
+        q_chunk = q_f32[:, head_start:head_end, :].transpose(0, 1).contiguous()
+        scores = torch.matmul(q_chunk, k_t)
+        head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
+        logits += (scores.relu() * head_weights).sum(dim=0)
+
+    if clean_logits:
+        offsets = torch.arange(seq_len_kv, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None]
+        )
+        logits = logits.masked_fill(~valid, float("-inf"))
+
+    return logits
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -371,6 +412,10 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
+    if current_platform.is_device_capability_family(120) and q[1] is None:
+        return _fp8_mqa_logits_torch_reference(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+        )
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
     return _fp8_fp4_mqa_logits_impl(
