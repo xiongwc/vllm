@@ -65,6 +65,13 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
+from vllm.v1.attention.backends.mla.sparse_mla_reference import (
+    accumulate_reference_attention_chunk,
+    finish_reference_attention_no_sink,
+    merge_reference_attention_with_sink,
+    new_reference_attention_state,
+    sink_aware_reference_attention,
+)
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -869,165 +876,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             model_version="deepseek_v4",
         )
 
-    def _sink_aware_reference_attention(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        valid_tokens: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        subset_output, subset_lse = self._reference_attention_no_sink(
-            q=q,
-            kv=kv,
-            valid_tokens=valid_tokens,
-        )
-        self._merge_reference_attention_with_sink(
-            subset_outputs=[subset_output],
-            subset_lses=[subset_lse],
-            output=output,
-        )
-
-    def _reference_attention_no_sink(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        valid_tokens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_bhd, max_score, denom, acc = self._new_reference_attention_state(q)
-        max_score, denom, acc = self._accumulate_reference_attention_chunk(
-            q_bhd=q_bhd,
-            kv=kv,
-            valid_tokens=valid_tokens,
-            max_score=max_score,
-            denom=denom,
-            acc=acc,
-        )
-        return self._finish_reference_attention_no_sink(max_score, denom, acc)
-
-    def _new_reference_attention_state(
-        self,
-        q: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if q.dim() == 4:
-            q_bhd = q[:, 0, :, :].float()
-        else:
-            assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
-            q_bhd = q.float()
-        num_tokens = q_bhd.shape[0]
-        num_heads = q_bhd.shape[1]
-        head_dim = q_bhd.shape[2]
-        max_score = torch.full(
-            (num_tokens, num_heads),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        denom = torch.zeros_like(max_score)
-        acc = torch.zeros(
-            (num_tokens, num_heads, head_dim),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        return q_bhd, max_score, denom, acc
-
-    def _accumulate_reference_attention_chunk(
-        self,
-        q_bhd: torch.Tensor,
-        kv: torch.Tensor,
-        valid_tokens: torch.Tensor,
-        max_score: torch.Tensor,
-        denom: torch.Tensor,
-        acc: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kv_btd = kv.float()
-        scores = torch.einsum("bhd,btd->bht", q_bhd, kv_btd) * self.scale
-        scores = scores.masked_fill(~valid_tokens[:, None, :], float("-inf"))
-
-        chunk_max = scores.amax(dim=-1)
-        next_max = torch.maximum(max_score, chunk_max)
-
-        previous_scale = torch.exp(max_score - next_max)
-        previous_scale = torch.nan_to_num(previous_scale)
-        weights = torch.exp(scores - next_max[:, :, None])
-        weights = torch.where(
-            valid_tokens[:, None, :],
-            weights,
-            torch.zeros((), dtype=weights.dtype, device=weights.device),
-        )
-        weights = torch.nan_to_num(weights)
-
-        acc = acc * previous_scale[:, :, None]
-        denom = denom * previous_scale
-        acc = acc + torch.einsum("bht,btd->bhd", weights, kv_btd)
-        denom = denom + weights.sum(dim=-1)
-        return next_max, denom, acc
-
-    def _finish_reference_attention(
-        self,
-        max_score: torch.Tensor,
-        denom: torch.Tensor,
-        acc: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        subset_output, subset_lse = self._finish_reference_attention_no_sink(
-            max_score,
-            denom,
-            acc,
-        )
-        self._merge_reference_attention_with_sink(
-            subset_outputs=[subset_output],
-            subset_lses=[subset_lse],
-            output=output,
-        )
-
-    def _finish_reference_attention_no_sink(
-        self,
-        max_score: torch.Tensor,
-        denom: torch.Tensor,
-        acc: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        valid = denom > 0
-        safe_denom = torch.where(valid, denom, torch.ones_like(denom))
-        subset_output = acc / safe_denom[:, :, None]
-        subset_output = torch.where(
-            valid[:, :, None],
-            subset_output,
-            torch.zeros((), dtype=subset_output.dtype, device=subset_output.device),
-        )
-        subset_lse = torch.where(
-            valid,
-            max_score + torch.log(safe_denom),
-            torch.full_like(max_score, float("-inf")),
-        )
-        return subset_output, subset_lse
-
-    def _merge_reference_attention_with_sink(
-        self,
-        subset_outputs: list[torch.Tensor],
-        subset_lses: list[torch.Tensor],
-        output: torch.Tensor,
-    ) -> None:
-        assert subset_outputs, "At least one attention subset is required"
-        assert len(subset_outputs) == len(subset_lses)
-
-        sink = self.attn_sink[None, :].float()
-        merge_max = sink
-        for subset_lse in subset_lses:
-            merge_max = torch.maximum(merge_max, subset_lse)
-
-        merged_acc = torch.zeros_like(subset_outputs[0], dtype=torch.float32)
-        merged_denom = torch.exp(sink - merge_max)
-        for subset_output, subset_lse in zip(subset_outputs, subset_lses):
-            subset_weight = torch.exp(subset_lse - merge_max)
-            subset_weight = torch.nan_to_num(subset_weight)
-            merged_acc = (
-                merged_acc + subset_output.float() * subset_weight[:, :, None]
-            )
-            merged_denom = merged_denom + subset_weight
-
-        reference_output = merged_acc / merged_denom[:, :, None]
-        output.copy_(reference_output.to(dtype=output.dtype))
-
     def _forward_sparse_mla_swa_decode_reference(
         self,
         q: torch.Tensor,
@@ -1060,7 +908,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         token_offsets = torch.arange(max_swa_len, device=q.device)
         valid_tokens = token_offsets[None, :] < swa_lens[:, None]
-        self._sink_aware_reference_attention(q, gathered_kv, valid_tokens, output)
+        sink_aware_reference_attention(
+            q=q,
+            kv=gathered_kv,
+            valid_tokens=valid_tokens,
+            scale=self.scale,
+            attn_sink=self.attn_sink,
+            output=output,
+        )
 
     def _forward_sparse_mla_compressed_decode_reference(
         self,
@@ -1101,7 +956,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         compressed_slot_ids = topk_indices[:, 0, :]
         q_bhd, comp_max_score, comp_denom, comp_acc = (
-            self._new_reference_attention_state(q)
+            new_reference_attention_state(q)
         )
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
@@ -1126,22 +981,23 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 & (compressed_slot_ids[:, chunk_start:chunk_end] >= 0)
             )
             comp_max_score, comp_denom, comp_acc = (
-                self._accumulate_reference_attention_chunk(
+                accumulate_reference_attention_chunk(
                     q_bhd=q_bhd,
                     kv=compressed_kv_chunk,
                     valid_tokens=compressed_valid,
                     max_score=comp_max_score,
                     denom=comp_denom,
                     acc=comp_acc,
+                    scale=self.scale,
                 )
             )
-        comp_output, comp_lse = self._finish_reference_attention_no_sink(
+        comp_output, comp_lse = finish_reference_attention_no_sink(
             comp_max_score,
             comp_denom,
             comp_acc,
         )
 
-        _, swa_max_score, swa_denom, swa_acc = self._new_reference_attention_state(q)
+        _, swa_max_score, swa_denom, swa_acc = new_reference_attention_state(q)
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         dequantize_and_gather_k_cache(
             swa_kv,
@@ -1155,23 +1011,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_offsets = torch.arange(max_swa_len, device=q.device)
         swa_valid = swa_offsets[None, :] < swa_lens[:, None]
         swa_max_score, swa_denom, swa_acc = (
-            self._accumulate_reference_attention_chunk(
+            accumulate_reference_attention_chunk(
                 q_bhd=q_bhd,
                 kv=swa_kv,
                 valid_tokens=swa_valid,
                 max_score=swa_max_score,
                 denom=swa_denom,
                 acc=swa_acc,
+                scale=self.scale,
             )
         )
-        swa_output, swa_lse = self._finish_reference_attention_no_sink(
+        swa_output, swa_lse = finish_reference_attention_no_sink(
             swa_max_score,
             swa_denom,
             swa_acc,
         )
-        self._merge_reference_attention_with_sink(
+        merge_reference_attention_with_sink(
             subset_outputs=[comp_output, swa_output],
             subset_lses=[comp_lse, swa_lse],
+            attn_sink=self.attn_sink,
             output=output,
         )
 
@@ -1195,9 +1053,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             q_chunk = q[token_start:token_end]
             lens_chunk = combined_lens[token_start:token_end]
             indices_chunk_full = combined_indices[token_start:token_end]
-            q_bhd, max_score, denom, acc = self._new_reference_attention_state(
-                q_chunk
-            )
+            q_bhd, max_score, denom, acc = new_reference_attention_state(q_chunk)
 
             for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
                 index_end = min(index_start + topk_chunk_size,
@@ -1218,23 +1074,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     torch.zeros((), dtype=indices_chunk.dtype, device=q.device),
                 ).long()
                 gathered_kv = kv_flat[safe_indices]
-                max_score, denom, acc = self._accumulate_reference_attention_chunk(
+                max_score, denom, acc = accumulate_reference_attention_chunk(
                     q_bhd=q_bhd,
                     kv=gathered_kv,
                     valid_tokens=valid_tokens,
                     max_score=max_score,
                     denom=denom,
                     acc=acc,
+                    scale=self.scale,
                 )
 
-            subset_output, subset_lse = self._finish_reference_attention_no_sink(
+            subset_output, subset_lse = finish_reference_attention_no_sink(
                 max_score,
                 denom,
                 acc,
             )
-            self._merge_reference_attention_with_sink(
+            merge_reference_attention_with_sink(
                 subset_outputs=[subset_output],
                 subset_lses=[subset_lse],
+                attn_sink=self.attn_sink,
                 output=output[token_start:token_end],
             )
 
