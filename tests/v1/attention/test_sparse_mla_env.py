@@ -15,7 +15,6 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     sparse_mla_reference_topk_chunk_size,
 )
 
-
 _SPARSE_MLA_ENV_NAMES = (
     "VLLM_TRITON_MLA_SPARSE",
     "VLLM_TRITON_MLA_SPARSE_DUMP",
