@@ -957,9 +957,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             denom_buffer,
             output_buffer,
         ) = current_workspace_manager().get_simultaneous(
-            ((query_chunk_size, q.shape[1]), torch.float32),
-            ((query_chunk_size, q.shape[1]), torch.float32),
-            ((query_chunk_size, q.shape[1], q.shape[-1]), torch.float32),
+            ((query_chunk_size, self.num_heads), torch.float32),
+            ((query_chunk_size, self.num_heads), torch.float32),
+            ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
         )
 
         for token_start in range(0, q.shape[0], query_chunk_size):
