@@ -426,7 +426,8 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
 def test_triton_gathered_attention_chunk_matches_reference(head_dim: int) -> None:
     torch.manual_seed(6)
     scale = 0.125
-    q = torch.randn(2, 1, 3, head_dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 5, head_dim, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :3]
     kv = torch.randn(2, 5, head_dim, device="cuda", dtype=torch.bfloat16)
     slot_ids = torch.tensor(
         [
@@ -477,7 +478,7 @@ def test_triton_gathered_attention_chunk_matches_reference(head_dim: int) -> Non
     offsets = torch.arange(slot_ids.shape[1], device="cuda")
     valid_tokens = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
     expected_output, expected_lse = reference_attention_no_sink(
-        q,
+        q_active,
         kv,
         valid_tokens,
         scale,
@@ -695,7 +696,8 @@ def test_triton_fp8ds_global_slots_multihead_attention_matches_reference(
         device="cuda",
     )
     lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
-    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :5]
     scale = 0.0625
 
     max_score = torch.full((2, 5), float("-inf"), device="cuda")
@@ -747,7 +749,7 @@ def test_triton_fp8ds_global_slots_multihead_attention_matches_reference(
     offsets = torch.arange(slot_ids.shape[1], device="cuda")
     valid_tokens = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
     expected_output, expected_lse = reference_attention_no_sink(
-        q,
+        q_active,
         gathered,
         valid_tokens,
         scale,
@@ -876,7 +878,8 @@ def test_triton_fp8ds_paged_multihead_attention_matches_singlehead_and_reference
     )
     seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
     gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
-    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :5]
     scale = 0.0625
 
     gathered = torch.zeros(2, 5, 512, device="cuda", dtype=torch.bfloat16)
@@ -949,7 +952,7 @@ def test_triton_fp8ds_paged_multihead_attention_matches_singlehead_and_reference
     offsets = torch.arange(gathered.shape[1], device="cuda")
     valid_tokens = offsets[None, :] < gather_lens[:, None]
     expected_output, expected_lse = reference_attention_no_sink(
-        q,
+        q_active,
         gathered,
         valid_tokens,
         scale,
@@ -1033,7 +1036,8 @@ def test_triton_fp8ds_paged_attention_with_sink_matches_reference() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
     torch.manual_seed(17)
-    q = torch.randn(5, 3, 16, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(5, 5, 16, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :3]
     kv = torch.randn(2, 7, 16, device="cuda", dtype=torch.bfloat16)
     kv_flat = kv.reshape(-1, q.shape[-1])
     combined_indices = torch.tensor(
@@ -1050,7 +1054,7 @@ def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
     combined_lens = torch.tensor([5, 4, 0, 6, 5], dtype=torch.int32, device="cuda")
     sink = torch.tensor([-0.5, 1.0, 0.25], dtype=torch.float32, device="cuda")
     scale = 0.375
-    output = torch.empty_like(q)
+    output = torch.empty_like(q_active)
 
     for token_start in (0, 2, 4):
         token_end = min(token_start + 2, q.shape[0])
@@ -1058,12 +1062,18 @@ def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
         indices_chunk = combined_indices[token_start:token_end]
         lens_chunk = combined_lens[token_start:token_end]
         max_score = torch.full(
-            (q_chunk.shape[0], q.shape[1]),
+            (q_chunk.shape[0], q_active.shape[1]),
             float("-inf"),
             device="cuda",
         )
         denom = torch.zeros_like(max_score)
-        acc = torch.zeros_like(q_chunk, dtype=torch.float32)
+        acc = torch.zeros(
+            q_chunk.shape[0],
+            q_active.shape[1],
+            q_chunk.shape[-1],
+            device="cuda",
+            dtype=torch.float32,
+        )
         for index_start in (0, 3):
             index_end = min(index_start + 3, combined_indices.shape[-1])
             accumulate_indexed_sparse_mla_attention_chunk(
@@ -1093,9 +1103,9 @@ def test_triton_indexed_bf16_prefill_chunks_match_reference() -> None:
             output=output[token_start:token_end],
         )
 
-    expected = torch.empty_like(q)
+    expected = torch.empty_like(q_active)
     reference_sparse_mla_prefill(
-        q=q,
+        q=q_active,
         kv=kv,
         combined_indices=combined_indices,
         combined_lens=combined_lens,
