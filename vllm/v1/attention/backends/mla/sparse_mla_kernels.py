@@ -1599,7 +1599,7 @@ def finish_two_sparse_mla_attention_states_with_sink(
     assert output.shape[0] == acc0.shape[0]
     assert output.shape[1] >= acc0.shape[1]
     assert output.shape[2] == acc0.shape[2]
-    assert attn_sink.shape[0] == acc0.shape[1]
+    assert attn_sink.shape[0] >= acc0.shape[1]
     assert max_score0.dtype == torch.float32
     assert denom0.dtype == torch.float32
     assert acc0.dtype == torch.float32
@@ -1654,7 +1654,7 @@ def finish_sparse_mla_attention_with_sink(
     assert output.shape[0] == acc.shape[0]
     assert output.shape[1] >= acc.shape[1]
     assert output.shape[2] == acc.shape[2]
-    assert attn_sink.shape[0] == acc.shape[1]
+    assert attn_sink.shape[0] >= acc.shape[1]
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
     assert acc.dtype == torch.float32
