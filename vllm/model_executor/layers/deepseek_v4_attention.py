@@ -81,6 +81,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
+    sparse_mla_decode_head_block_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     merge_reference_attention_with_sink,
@@ -877,6 +878,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
+        head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if not _compare_sparse_mla_attention_enabled():
             fp8ds_paged_sparse_mla_attention_with_sink_multihead(
                 q=q,
@@ -890,7 +892,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 scale=self.scale,
                 attn_sink=self.attn_sink,
                 output=output,
-                head_block_size=1,
+                head_block_size=head_block_size,
                 num_heads=self.num_heads,
             )
             if output.shape[1] > self.num_heads:
@@ -922,7 +924,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
-            head_block_size=1,
+            head_block_size=head_block_size,
         )
         finish_sparse_mla_attention_with_sink(
             swa_max_score,
@@ -1003,6 +1005,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         compressed_slot_ids = topk_indices[:, 0, :]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if (
             compressed_topk <= topk_chunk_size
             and not _compare_sparse_mla_attention_enabled()
@@ -1023,7 +1026,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 scale=self.scale,
                 attn_sink=self.attn_sink,
                 output=output,
-                head_block_size=1,
+                head_block_size=head_block_size,
                 num_heads=self.num_heads,
             )
             if output.shape[1] > self.num_heads:
@@ -1065,7 +1068,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 max_score=comp_max_score,
                 denom=comp_denom,
                 acc=comp_acc,
-                head_block_size=1,
+                head_block_size=head_block_size,
             )
         accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
             q=q,
@@ -1080,7 +1083,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
-            head_block_size=1,
+            head_block_size=head_block_size,
         )
         finish_two_sparse_mla_attention_states_with_sink(
             comp_max_score,
