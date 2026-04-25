@@ -1017,3 +1017,100 @@ def finish_gathered_sparse_mla_attention(
         BLOCK_D=block_d,
         num_warps=4,
     )
+
+
+@triton.jit
+def _finish_attention_state_with_sink_kernel(
+    max_score_ptr,
+    denom_ptr,
+    acc_ptr,
+    sink_ptr,
+    output_ptr,
+    stride_state_t: tl.constexpr,
+    stride_state_h: tl.constexpr,
+    stride_acc_t: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    stride_acc_d: tl.constexpr,
+    stride_output_t: tl.constexpr,
+    stride_output_h: tl.constexpr,
+    stride_output_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_head = tl.program_id(0)
+    block_d = tl.program_id(1)
+    token_idx = token_head // num_heads
+    head_idx = token_head - token_idx * num_heads
+    offsets = block_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    dim_mask = offsets < head_dim
+
+    state_offset = token_idx * stride_state_t + head_idx * stride_state_h
+    running_max = tl.load(max_score_ptr + state_offset)
+    running_denom = tl.load(denom_ptr + state_offset)
+    sink = tl.load(sink_ptr + head_idx)
+    merge_max = tl.maximum(running_max, sink)
+    has_tokens = running_denom > 0.0
+    subset_scale = tl.where(has_tokens, tl.exp(running_max - merge_max), 0.0)
+    subset_weight = running_denom * subset_scale
+    sink_weight = tl.exp(sink - merge_max)
+    inv_total = 1.0 / (subset_weight + sink_weight)
+
+    acc_values = tl.load(
+        acc_ptr
+        + token_idx * stride_acc_t
+        + head_idx * stride_acc_h
+        + offsets * stride_acc_d,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+    output = acc_values * subset_scale * inv_total
+    tl.store(
+        output_ptr
+        + token_idx * stride_output_t
+        + head_idx * stride_output_h
+        + offsets * stride_output_d,
+        output,
+        mask=dim_mask,
+    )
+
+
+def finish_sparse_mla_attention_with_sink(
+    max_score: torch.Tensor,
+    denom: torch.Tensor,
+    acc: torch.Tensor,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    assert max_score.shape == denom.shape
+    assert acc.shape[:2] == max_score.shape
+    assert output.shape == acc.shape
+    assert attn_sink.shape[0] == acc.shape[1]
+    assert max_score.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert acc.dtype == torch.float32
+    assert max_score.is_cuda and denom.is_cuda and acc.is_cuda
+    assert attn_sink.is_cuda and output.is_cuda
+
+    num_tokens, num_heads, head_dim = acc.shape
+    block_d = min(128, triton.next_power_of_2(head_dim))
+    grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
+    _finish_attention_state_with_sink_kernel[grid](
+        max_score,
+        denom,
+        acc,
+        attn_sink,
+        output,
+        max_score.stride(0),
+        max_score.stride(1),
+        acc.stride(0),
+        acc.stride(1),
+        acc.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        num_heads,
+        head_dim,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
