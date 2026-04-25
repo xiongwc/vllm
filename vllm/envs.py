@@ -166,6 +166,11 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_DUMP: bool = False
+    VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str = ""
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int | None = None
     VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION: bool = False
     VLLM_SM120_ATTENTION_DUMP_PATH: str = ""
     VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION: bool = False
@@ -1271,7 +1276,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
-    # Experimental DeepSeek V4 SM120 reference attention controls.
+    # Experimental sparse MLA reference fallback controls.
+    # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
+    # is unavailable; set 0/1 to force-disable/force-enable the fallback.
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
+        else os.getenv("VLLM_TRITON_MLA_SPARSE", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP": lambda: (
+        os.getenv("VLLM_TRITON_MLA_SPARSE_DUMP", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP_PATH": lambda: os.getenv(
+        "VLLM_TRITON_MLA_SPARSE_DUMP_PATH", ""
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE")
+    ),
+    # Legacy names kept as aliases for the SM120 prototype scripts.
     "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION": lambda: (
         os.getenv("VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION", "").lower()
         in ("1", "true", "yes", "on")
