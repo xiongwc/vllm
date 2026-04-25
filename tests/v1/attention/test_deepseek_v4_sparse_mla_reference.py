@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_gathered_sparse_mla_attention_chunk,
     accumulate_indexed_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
+    finish_sparse_mla_attention_with_sink,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
 )
@@ -311,6 +312,39 @@ def test_triton_single_lse_merge_with_sink_matches_reference() -> None:
         attn_sink=sink,
         output=output,
     )
+    merge_reference_attention_with_sink(
+        subset_outputs=[subset_output],
+        subset_lses=[subset_lse],
+        attn_sink=sink,
+        output=expected,
+    )
+
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
+    torch.manual_seed(18)
+    max_score = torch.randn(4, 3, device="cuda", dtype=torch.float32)
+    denom = torch.rand(4, 3, device="cuda", dtype=torch.float32) + 0.1
+    denom[1, 2] = 0.0
+    max_score[1, 2] = float("-inf")
+    acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
+    sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
+
+    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, output)
+
+    subset_output = torch.empty_like(acc)
+    subset_lse = torch.empty_like(max_score)
+    finish_gathered_sparse_mla_attention(
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        output=subset_output,
+        lse=subset_lse,
+    )
+    expected = torch.empty_like(output)
     merge_reference_attention_with_sink(
         subset_outputs=[subset_output],
         subset_lses=[subset_lse],
