@@ -79,6 +79,8 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_indexed_sparse_mla_attention_chunk,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
+    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
+    fp8ds_paged_sparse_mla_attention_with_sink_multihead,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     merge_reference_attention_with_sink,
@@ -875,6 +877,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
+        if not _compare_sparse_mla_attention_enabled():
+            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                candidate_offset=0,
+                num_candidates=max_swa_len,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                head_block_size=1,
+                num_heads=self.num_heads,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
+
         (
             swa_max_score,
             swa_denom,
@@ -900,7 +922,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
-            head_block_size=4,
+            head_block_size=1,
         )
         finish_sparse_mla_attention_with_sink(
             swa_max_score,
@@ -979,6 +1001,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compressed_topk,
             sparse_mla_reference_topk_chunk_size(),
         )
+        compressed_slot_ids = topk_indices[:, 0, :]
+        swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
+        if (
+            compressed_topk <= topk_chunk_size
+            and not _compare_sparse_mla_attention_enabled()
+        ):
+            fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                slot_ids=compressed_slot_ids,
+                topk_lens=topk_lens,
+                compressed_block_size=compressed_block_size,
+                swa_k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                swa_block_size=swa_metadata.block_size,
+                num_compressed_candidates=compressed_topk,
+                num_swa_candidates=max_swa_len,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                head_block_size=1,
+                num_heads=self.num_heads,
+            )
+            if output.shape[1] > self.num_heads:
+                output[:, self.num_heads :].zero_()
+            return
+
         (
             comp_max_score,
             comp_denom,
@@ -1001,7 +1052,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_denom.zero_()
         swa_acc.zero_()
 
-        compressed_slot_ids = topk_indices[:, 0, :]
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
             accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
@@ -1015,9 +1065,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 max_score=comp_max_score,
                 denom=comp_denom,
                 acc=comp_acc,
-                head_block_size=4,
+                head_block_size=1,
             )
-        swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
@@ -1031,7 +1080,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
-            head_block_size=4,
+            head_block_size=1,
         )
         finish_two_sparse_mla_attention_states_with_sink(
             comp_max_score,

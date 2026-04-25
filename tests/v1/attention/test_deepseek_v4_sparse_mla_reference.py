@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_sparse_mla_reference_cudagraphs_if_enabled,
+    sparse_mla_reference_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
@@ -25,6 +26,8 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     finish_gathered_sparse_mla_attention,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
+    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
+    fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
 )
@@ -45,6 +48,13 @@ _FP8_DIM = 448
 _ROPE_DIM = 64
 _SCALE_DIM = 8
 _TOKEN_DATA_SIZE = _FP8_DIM + _ROPE_DIM * 2
+
+
+def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
+    monkeypatch.delenv("VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE", raising=False)
+
+    assert sparse_mla_reference_topk_chunk_size() == 512
 
 
 def _masked_scores(
@@ -769,7 +779,7 @@ def test_triton_fp8ds_global_slots_attention_chunk_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
-@pytest.mark.parametrize("head_block_size", [2, 4])
+@pytest.mark.parametrize("head_block_size", [1, 2, 4])
 def test_triton_fp8ds_global_slots_multihead_attention_matches_reference(
     head_block_size: int,
 ) -> None:
@@ -955,7 +965,7 @@ def test_triton_fp8ds_paged_attention_chunk_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
-@pytest.mark.parametrize("head_block_size", [2, 4])
+@pytest.mark.parametrize("head_block_size", [1, 2, 4])
 def test_triton_fp8ds_paged_multihead_attention_matches_singlehead_and_reference(
     head_block_size: int,
 ) -> None:
@@ -1131,6 +1141,192 @@ def test_triton_fp8ds_paged_attention_with_sink_matches_reference() -> None:
     expected = _golden_sink_attention(q, gathered, valid_tokens, scale, sink)
 
     torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_fp8ds_paged_attention_with_sink_direct_matches_state_path() -> None:
+    torch.manual_seed(29)
+    block_size = 4
+    k_cache = torch.zeros(
+        4,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_table = torch.tensor(
+        [[1, 0, 2, 3], [2, 3, 1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(-0.5, 0.5, 5, device="cuda")
+    scale = 0.0625
+
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            physical_block = int(block_table[token_idx, pos // block_size].item())
+            slot = physical_block * block_size + pos % block_size
+            _write_fp8_ds_mla_token(k_cache, slot, block_size)
+
+    max_score = torch.full((2, 5), float("-inf"), device="cuda")
+    denom = torch.zeros((2, 5), device="cuda")
+    acc = torch.zeros((2, 5, 512), device="cuda")
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        max_score=max_score,
+        denom=denom,
+        acc=acc,
+        head_block_size=1,
+    )
+    expected = torch.empty(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, expected)
+
+    actual = torch.empty_like(expected)
+    fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+        q=q,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        attn_sink=sink,
+        output=actual,
+        head_block_size=1,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_triton_fp8ds_global_paged_attention_with_sink_direct_matches_state_path(
+) -> None:
+    torch.manual_seed(31)
+    compressed_block_size = 4
+    swa_block_size = 4
+    compressed_cache = torch.zeros(
+        4,
+        compressed_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    swa_cache = torch.zeros(
+        4,
+        swa_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    slot_ids = torch.tensor(
+        [[0, 3, -1, 8, 1], [7, -1, 4, 0, 8]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor(
+        [[1, 0, 2, 3], [2, 3, 1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(-1.0, 1.0, 5, device="cuda")
+    scale = 0.0625
+
+    for slot in (0, 1, 3, 4, 7, 8):
+        _write_fp8_ds_mla_token(compressed_cache, slot, compressed_block_size)
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            physical_block = int(block_table[token_idx, pos // swa_block_size].item())
+            slot = physical_block * swa_block_size + pos % swa_block_size
+            _write_fp8_ds_mla_token(swa_cache, slot, swa_block_size)
+
+    comp_max = torch.full((2, 5), float("-inf"), device="cuda")
+    comp_denom = torch.zeros((2, 5), device="cuda")
+    comp_acc = torch.zeros((2, 5, 512), device="cuda")
+    swa_max = torch.full((2, 5), float("-inf"), device="cuda")
+    swa_denom = torch.zeros((2, 5), device="cuda")
+    swa_acc = torch.zeros((2, 5, 512), device="cuda")
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=compressed_cache,
+        slot_ids=slot_ids,
+        lens=topk_lens,
+        block_size=compressed_block_size,
+        candidate_offset=0,
+        scale=scale,
+        max_score=comp_max,
+        denom=comp_denom,
+        acc=comp_acc,
+        head_block_size=1,
+    )
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        block_size=swa_block_size,
+        candidate_offset=0,
+        num_candidates=5,
+        scale=scale,
+        max_score=swa_max,
+        denom=swa_denom,
+        acc=swa_acc,
+        head_block_size=1,
+    )
+    expected = torch.empty(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    finish_two_sparse_mla_attention_states_with_sink(
+        comp_max,
+        comp_denom,
+        comp_acc,
+        swa_max,
+        swa_denom,
+        swa_acc,
+        sink,
+        expected,
+    )
+
+    actual = torch.empty_like(expected)
+    fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+        q=q,
+        compressed_k_cache=compressed_cache,
+        slot_ids=slot_ids,
+        topk_lens=topk_lens,
+        compressed_block_size=compressed_block_size,
+        swa_k_cache=swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=gather_lens,
+        block_table=block_table,
+        swa_block_size=swa_block_size,
+        num_compressed_candidates=5,
+        num_swa_candidates=5,
+        scale=scale,
+        attn_sink=sink,
+        output=actual,
+        head_block_size=1,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
