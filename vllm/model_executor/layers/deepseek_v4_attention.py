@@ -18,6 +18,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
+from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
@@ -28,6 +29,9 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+)
+from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
+    deepseek_v4_sm12_fp8_einsum,
 )
 
 if TYPE_CHECKING:
@@ -122,6 +126,22 @@ def _deepseek_v4_fp8_einsum_config(
     if capability_major == 10:
         return (1, 1, 128), True
     return (1, 128, 128), False
+
+
+def _use_deepseek_v4_sm12_triton_fp8_einsum(
+    equation: str,
+    recipe: list[int],
+    b_scale: torch.Tensor,
+) -> bool:
+    capability = current_platform.get_device_capability()
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    return (
+        capability is not None
+        and capability.major == 12
+        and equation == "bhr,hdr->bhd"
+        and tuple(recipe) == (1, 128, 128)
+        and b_scale.dtype in (torch.float32, e8m0_dtype)
+    )
 
 
 def _dump_sparse_mla_attention_state(
@@ -717,6 +737,10 @@ def deepseek_v4_fp8_einsum(
                 (out_rank + scale_mn - 1) // scale_mn,
                 (hidden_size + scale_k - 1) // scale_k,
             )
+
+        if _use_deepseek_v4_sm12_triton_fp8_einsum(equation, recipe, b_scale):
+            deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, out)
+            return
 
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 

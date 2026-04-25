@@ -852,6 +852,12 @@ def w8a8_triton_block_scaled_mm(
     N, K = B.shape
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None:
+        if As.dtype == e8m0_dtype:
+            As = _upcast_e8m0_to_fp32(As)
+        if Bs.dtype == e8m0_dtype:
+            Bs = _upcast_e8m0_to_fp32(Bs)
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)

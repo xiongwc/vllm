@@ -136,6 +136,48 @@ def test_w8a8_block_fp8_matmul(M, N, K, block_size, out_dtype, seed):
 
 
 @pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu"),
+    reason="torch does not expose float8_e8m0fnu",
+)
+@torch.inference_mode()
+def test_w8a8_block_fp8_matmul_accepts_e8m0_scales():
+    torch.manual_seed(0)
+    M, N, K = 7, 256, 256
+    block_size = [128, 128]
+    out_dtype = torch.bfloat16
+    fp8_info = torch.finfo(current_platform.fp8_dtype())
+    fp8_max, fp8_min = fp8_info.max, fp8_info.min
+
+    A_fp32 = (torch.rand(M, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
+    A_fp8 = A_fp32.clamp(min=fp8_min, max=fp8_max).to(current_platform.fp8_dtype())
+    B_fp32 = (torch.rand(N, K, dtype=torch.float32) - 0.5) * 2 * fp8_max
+    B_fp8 = B_fp32.clamp(min=fp8_min, max=fp8_max).to(current_platform.fp8_dtype())
+
+    scale_choices = torch.tensor([0.00390625, 0.0078125, 0.015625, 0.03125])
+    As = scale_choices[torch.randint(0, len(scale_choices), (M, K // 128))]
+    Bs = scale_choices[torch.randint(0, len(scale_choices), (N // 128, K // 128))]
+    As_e8m0 = As.to(torch.float8_e8m0fnu)
+    Bs_e8m0 = Bs.to(torch.float8_e8m0fnu)
+
+    ref_out = native_w8a8_block_matmul(
+        A_fp8,
+        B_fp8,
+        As_e8m0.to(torch.float32),
+        Bs_e8m0.to(torch.float32),
+        block_size,
+        out_dtype,
+    )
+    out = w8a8_triton_block_scaled_mm(
+        A_fp8, B_fp8, As_e8m0, Bs_e8m0, block_size, out_dtype
+    )
+
+    rel_diff = torch.mean(
+        torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
+    ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
+    assert rel_diff < 0.001
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
 )
 @torch.inference_mode()
