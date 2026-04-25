@@ -259,7 +259,8 @@ def test_two_subset_lse_merge_with_sink_matches_reference() -> None:
 def test_gathered_bf16_attention_chunks_match_reference(head_dim: int) -> None:
     torch.manual_seed(2)
     scale = 0.125
-    q = torch.randn(2, 1, 3, head_dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 5, head_dim, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :3]
     kv = torch.randn(2, 5, head_dim, device="cuda", dtype=torch.bfloat16)
     slot_ids = torch.tensor(
         [[0, 1, -1, 3, 4], [5, -1, 7, 8, -1]],
@@ -284,7 +285,7 @@ def test_gathered_bf16_attention_chunks_match_reference(head_dim: int) -> None:
     offsets = torch.arange(slot_ids.shape[1], device="cuda")
     valid_tokens = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
     expected_output, expected_lse = _golden_no_sink_attention(
-        q, kv, valid_tokens, scale
+        q_active, kv, valid_tokens, scale
     )
     torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
@@ -293,7 +294,8 @@ def test_gathered_bf16_attention_chunks_match_reference(head_dim: int) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_indexed_bf16_prefill_chunks_match_sink_reference() -> None:
     torch.manual_seed(3)
-    q = torch.randn(5, 3, 16, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(5, 5, 16, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :3]
     kv = torch.randn(2, 7, 16, device="cuda", dtype=torch.bfloat16)
     kv_flat = kv.reshape(-1, q.shape[-1])
     indices = torch.tensor(
@@ -310,16 +312,22 @@ def test_indexed_bf16_prefill_chunks_match_sink_reference() -> None:
     lens = torch.tensor([5, 4, 0, 6, 5], dtype=torch.int32, device="cuda")
     sink = torch.tensor([-0.5, 1.0, 0.25], dtype=torch.float32, device="cuda")
     scale = 0.375
-    output = torch.empty_like(q)
+    output = torch.empty_like(q_active)
 
     for token_start in (0, 2, 4):
         token_end = min(token_start + 2, q.shape[0])
         q_chunk = q[token_start:token_end]
         max_score = torch.full(
-            (q_chunk.shape[0], q.shape[1]), float("-inf"), device="cuda"
+            (q_chunk.shape[0], q_active.shape[1]), float("-inf"), device="cuda"
         )
         denom = torch.zeros_like(max_score)
-        acc = torch.zeros_like(q_chunk, dtype=torch.float32)
+        acc = torch.zeros(
+            q_chunk.shape[0],
+            q_active.shape[1],
+            q_chunk.shape[-1],
+            device="cuda",
+            dtype=torch.float32,
+        )
         for index_start in (0, 3):
             index_end = min(index_start + 3, indices.shape[-1])
             accumulate_indexed_sparse_mla_attention_chunk(
@@ -342,7 +350,7 @@ def test_indexed_bf16_prefill_chunks_match_sink_reference() -> None:
     valid = (offsets[None, :] < lens[:, None]) & (indices >= 0)
     safe_indices = torch.where(valid, indices, torch.zeros_like(indices)).long()
     gathered = kv_flat[safe_indices]
-    expected = _golden_sink_attention(q, gathered, valid, scale, sink)
+    expected = _golden_sink_attention(q_active, gathered, valid, scale, sink)
     torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
@@ -367,7 +375,8 @@ def test_fp8ds_paged_multihead_attention_matches_singlehead_and_reference(
     )
     seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
     gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
-    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :5]
     scale = 0.0625
 
     gathered = torch.zeros(2, 5, 512, device="cuda", dtype=torch.bfloat16)
@@ -428,7 +437,9 @@ def test_fp8ds_paged_multihead_attention_matches_singlehead_and_reference(
     output, lse = _finish_state(multi_max, multi_denom, multi_acc)
     offsets = torch.arange(gathered.shape[1], device="cuda")
     valid = offsets[None, :] < gather_lens[:, None]
-    expected_output, expected_lse = _golden_no_sink_attention(q, gathered, valid, scale)
+    expected_output, expected_lse = _golden_no_sink_attention(
+        q_active, gathered, valid, scale
+    )
     torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
 
@@ -507,7 +518,8 @@ def test_fp8ds_global_slot_multihead_attention_matches_reference(
         device="cuda",
     )
     lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
-    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    q_active = q[:, :, :5]
     scale = 0.0625
     max_score = torch.full((2, 5), float("-inf"), device="cuda")
     denom = torch.zeros((2, 5), device="cuda")
@@ -549,7 +561,9 @@ def test_fp8ds_global_slot_multihead_attention_matches_reference(
                 gathered[token_idx, topk_idx] = expected_by_slot[slot]
     offsets = torch.arange(slot_ids.shape[1], device="cuda")
     valid = (offsets[None, :] < lens[:, None]) & (slot_ids >= 0)
-    expected_output, expected_lse = _golden_no_sink_attention(q, gathered, valid, scale)
+    expected_output, expected_lse = _golden_no_sink_attention(
+        q_active, gathered, valid, scale
+    )
     torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
 
