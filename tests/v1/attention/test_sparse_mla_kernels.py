@@ -9,10 +9,12 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk,
+    accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_gathered_sparse_mla_attention_chunk,
     accumulate_indexed_sparse_mla_attention_chunk,
     finish_gathered_sparse_mla_attention,
     finish_sparse_mla_attention_with_sink,
+    finish_two_sparse_mla_attention_states_with_sink,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
 )
@@ -195,6 +197,46 @@ def test_finish_with_sink_matches_finish_then_merge_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_finish_two_states_with_sink_matches_finish_then_merge_reference() -> None:
+    torch.manual_seed(8)
+    comp_max = torch.randn(4, 3, device="cuda", dtype=torch.float32)
+    comp_denom = torch.rand(4, 3, device="cuda", dtype=torch.float32) + 0.1
+    comp_acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
+    swa_max = torch.randn(4, 3, device="cuda", dtype=torch.float32)
+    swa_denom = torch.rand(4, 3, device="cuda", dtype=torch.float32) + 0.1
+    swa_acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
+    sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
+
+    comp_denom[0, 1] = 0.0
+    comp_max[0, 1] = float("-inf")
+    swa_denom[2, 0] = 0.0
+    swa_max[2, 0] = float("-inf")
+    comp_denom[3, 2] = 0.0
+    comp_max[3, 2] = float("-inf")
+    swa_denom[3, 2] = 0.0
+    swa_max[3, 2] = float("-inf")
+
+    output = torch.empty(4, 3, 17, device="cuda", dtype=torch.bfloat16)
+    finish_two_sparse_mla_attention_states_with_sink(
+        comp_max,
+        comp_denom,
+        comp_acc,
+        swa_max,
+        swa_denom,
+        swa_acc,
+        sink,
+        output,
+    )
+
+    comp_output, comp_lse = _finish_state(comp_max, comp_denom, comp_acc)
+    swa_output, swa_lse = _finish_state(swa_max, swa_denom, swa_acc)
+    expected = _golden_merge_with_sink(
+        [comp_output, swa_output], [comp_lse, swa_lse], sink
+    )
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_two_subset_lse_merge_with_sink_matches_reference() -> None:
     torch.manual_seed(1)
     out0 = torch.randn(3, 4, 9, device="cuda", dtype=torch.float32)
@@ -302,6 +344,93 @@ def test_indexed_bf16_prefill_chunks_match_sink_reference() -> None:
     gathered = kv_flat[safe_indices]
     expected = _golden_sink_attention(q, gathered, valid, scale, sink)
     torch.testing.assert_close(output.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("head_block_size", [2, 4])
+def test_fp8ds_paged_multihead_attention_matches_singlehead_and_reference(
+    head_block_size: int,
+) -> None:
+    torch.manual_seed(9)
+    block_size = 4
+    k_cache = torch.zeros(
+        4,
+        block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_table = torch.tensor(
+        [[1, 0, 2, 3], [2, 3, 1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([7, 11], dtype=torch.int32, device="cuda")
+    gather_lens = torch.tensor([3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    scale = 0.0625
+
+    gathered = torch.zeros(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    expected_by_slot: dict[int, torch.Tensor] = {}
+    for token_idx in range(seq_lens.shape[0]):
+        start_pos = int(seq_lens[token_idx].item() - gather_lens[token_idx].item())
+        for gather_idx in range(int(gather_lens[token_idx].item())):
+            pos = start_pos + gather_idx
+            physical_block = int(block_table[token_idx, pos // block_size].item())
+            slot = physical_block * block_size + pos % block_size
+            expected_by_slot.setdefault(
+                slot, _write_fp8_ds_mla_token(k_cache, slot, block_size)
+            )
+            gathered[token_idx, gather_idx] = expected_by_slot[slot]
+
+    single_max = torch.full((2, 5), float("-inf"), device="cuda")
+    single_denom = torch.zeros((2, 5), device="cuda")
+    single_acc = torch.zeros((2, 5, 512), device="cuda")
+    multi_max = torch.full_like(single_max, float("-inf"))
+    multi_denom = torch.zeros_like(single_denom)
+    multi_acc = torch.zeros_like(single_acc)
+
+    for candidate_offset, num_candidates in ((0, 2), (2, 3)):
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk(
+            q,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            scale,
+            single_max,
+            single_denom,
+            single_acc,
+            candidate_offset=candidate_offset,
+            num_candidates=num_candidates,
+        )
+        accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+            q,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            scale,
+            multi_max,
+            multi_denom,
+            multi_acc,
+            candidate_offset=candidate_offset,
+            num_candidates=num_candidates,
+            head_block_size=head_block_size,
+        )
+
+    torch.testing.assert_close(multi_max, single_max, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(multi_denom, single_denom, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(multi_acc, single_acc, rtol=2e-2, atol=2e-2)
+
+    output, lse = _finish_state(multi_max, multi_denom, multi_acc)
+    offsets = torch.arange(gathered.shape[1], device="cuda")
+    valid = offsets[None, :] < gather_lens[:, None]
+    expected_output, expected_lse = _golden_no_sink_attention(q, gathered, valid, scale)
+    torch.testing.assert_close(output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
