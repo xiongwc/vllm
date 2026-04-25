@@ -4,8 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
