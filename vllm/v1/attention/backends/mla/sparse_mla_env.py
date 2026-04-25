@@ -14,6 +14,9 @@ _TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
 _TRITON_MLA_SPARSE_DUMP_PATH_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
 _TRITON_MLA_SPARSE_TOPK_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE"
 _TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
+_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
+    "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH"
+)
 
 _LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
 _LEGACY_SM120_ATTENTION_DUMP_PATH_ENV = "VLLM_SM120_ATTENTION_DUMP_PATH"
@@ -76,8 +79,20 @@ def is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
     return _is_sm12x_device(device)
 
 
+def sparse_mla_reference_cudagraphs_allowed() -> bool:
+    return _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV) or False
+
+
 def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
     if not is_sparse_mla_reference_attention_enabled_for_platform():
+        return
+    if sparse_mla_reference_cudagraphs_allowed():
+        logger.warning_once(
+            "Keeping vLLM compile and CUDA graphs enabled for the DeepSeek V4 "
+            "Triton sparse MLA fallback because "
+            f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1. This is an "
+            "experimental performance mode."
+        )
         return
 
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
