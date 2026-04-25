@@ -5,6 +5,7 @@ DeepseekV4 MLA Attention Layer
 """
 
 import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
@@ -64,6 +66,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    disable_sparse_mla_reference_cudagraphs_if_enabled,
     is_sparse_mla_attention_dump_enabled,
     is_sparse_mla_reference_attention_enabled,
     sparse_mla_attention_dump_path,
@@ -76,6 +79,12 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_indexed_sparse_mla_attention_chunk,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
+)
+from vllm.v1.attention.backends.mla.sparse_mla_reference import (
+    merge_reference_attention_with_sink,
+    reference_attention_no_sink,
+    reference_sparse_mla_prefill,
+    sink_aware_reference_attention,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -206,6 +215,73 @@ def _write_sparse_mla_attention_state_if_enabled(
         fields=fields,
     )
 
+
+
+def _compare_sparse_mla_attention_enabled() -> bool:
+    return os.getenv("VLLM_TRITON_MLA_SPARSE_COMPARE") == "1"
+
+
+def _assert_sparse_mla_close(
+    *,
+    name: str,
+    prefix: str,
+    compress_ratio: int,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> None:
+    actual_f = actual.float()
+    expected_f = expected.float()
+    diff = (actual_f - expected_f).abs()
+    finite_diff = diff[torch.isfinite(diff)]
+    max_diff = float(finite_diff.max().item()) if finite_diff.numel() > 0 else 0.0
+    mean_diff = float(finite_diff.mean().item()) if finite_diff.numel() > 0 else 0.0
+    actual_nonfinite = int((~torch.isfinite(actual_f)).sum().item())
+    expected_nonfinite = int((~torch.isfinite(expected_f)).sum().item())
+    shared_nan = int((torch.isnan(actual_f) & torch.isnan(expected_f)).sum().item())
+    actual_finite = actual_f[torch.isfinite(actual_f)]
+    expected_finite = expected_f[torch.isfinite(expected_f)]
+    actual_max_abs = (
+        float(actual_finite.abs().max().item()) if actual_finite.numel() > 0 else 0.0
+    )
+    expected_max_abs = (
+        float(expected_finite.abs().max().item())
+        if expected_finite.numel() > 0
+        else 0.0
+    )
+    atol = float(os.getenv("VLLM_TRITON_MLA_SPARSE_COMPARE_ATOL", "0.05"))
+    rtol = float(os.getenv("VLLM_TRITON_MLA_SPARSE_COMPARE_RTOL", "0.05"))
+    if not torch.allclose(actual_f, expected_f, atol=atol, rtol=rtol):
+        raise RuntimeError(
+            "DeepseekV4 sparse MLA compare failed: "
+            f"{name} {prefix=} {compress_ratio=} "
+            f"max_finite_diff={max_diff:.6f} "
+            f"mean_finite_diff={mean_diff:.6f} "
+            f"actual_nonfinite={actual_nonfinite} "
+            f"expected_nonfinite={expected_nonfinite} shared_nan={shared_nan} "
+            f"actual_max_abs={actual_max_abs:.6f} "
+            f"expected_max_abs={expected_max_abs:.6f} "
+            f"atol={atol} rtol={rtol} "
+            f"actual_shape={tuple(actual.shape)} expected_shape={tuple(expected.shape)}"
+        )
+
+
+def _assert_sparse_mla_finite(
+    *,
+    name: str,
+    prefix: str,
+    compress_ratio: int,
+    tensor: torch.Tensor,
+) -> None:
+    tensor_f = tensor.float()
+    nonfinite = int((~torch.isfinite(tensor_f)).sum().item())
+    if nonfinite == 0:
+        return
+    raise RuntimeError(
+        "DeepseekV4 sparse MLA input became non-finite: "
+        f"{name} {prefix=} {compress_ratio=} nonfinite={nonfinite} "
+        f"shape={tuple(tensor.shape)}"
+    )
+
 # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
@@ -294,6 +370,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.window_size = window_size
         self.compress_ratio = compress_ratio if compress_ratio is not None else 1
         self.prefix = prefix
+
+        disable_sparse_mla_reference_cudagraphs_if_enabled(mla_modules.vllm_config)
 
         # Extract config from vllm_config
         config = mla_modules.vllm_config.model_config.hf_config
@@ -824,6 +902,44 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.attn_sink,
             output=output,
         )
+        if output.shape[1] > self.num_heads:
+            output[:, self.num_heads :].zero_()
+        if _compare_sparse_mla_attention_enabled():
+            _assert_sparse_mla_finite(
+                name="swa_decode_q",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                tensor=q[:, :, : self.num_heads],
+            )
+            gathered = torch.empty(
+                (num_decode_tokens, max_swa_len, q.shape[-1]),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            dequantize_and_gather_k_cache(
+                gathered,
+                swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                offset=0,
+            )
+            candidate_offsets = torch.arange(
+                max_swa_len, dtype=torch.int32, device=q.device
+            )
+            valid_tokens = candidate_offsets[None, :] < swa_lens[:, None]
+            expected = torch.empty_like(output)
+            sink_aware_reference_attention(
+                q, gathered, valid_tokens, self.scale, self.attn_sink, expected
+            )
+            _assert_sparse_mla_close(
+                name="swa_decode",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                actual=output[:, : self.num_heads],
+                expected=expected[:, : self.num_heads],
+            )
 
     def _forward_sparse_mla_compressed_decode_reference(
         self,
@@ -920,6 +1036,68 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.attn_sink,
             output=output,
         )
+        if output.shape[1] > self.num_heads:
+            output[:, self.num_heads :].zero_()
+        if _compare_sparse_mla_attention_enabled():
+            _assert_sparse_mla_finite(
+                name="compressed_decode_q",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                tensor=q[:, :, : self.num_heads],
+            )
+            comp_kv = torch.empty(
+                (num_decode_tokens, compressed_topk, q.shape[-1]),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            dequantize_global_slots_k_cache(
+                comp_kv, compressed_k_cache, compressed_slot_ids, compressed_block_size
+            )
+            comp_offsets = torch.arange(
+                compressed_topk, dtype=torch.int32, device=q.device
+            )
+            comp_valid = (
+                (comp_offsets[None, :] < topk_lens[:, None])
+                & (compressed_slot_ids >= 0)
+            )
+            comp_output, comp_lse = reference_attention_no_sink(
+                q, comp_kv, comp_valid, self.scale
+            )
+
+            swa_kv = torch.empty(
+                (num_decode_tokens, max_swa_len, q.shape[-1]),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            dequantize_and_gather_k_cache(
+                swa_kv,
+                swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                offset=0,
+            )
+            swa_offsets = torch.arange(max_swa_len, dtype=torch.int32, device=q.device)
+            swa_valid = swa_offsets[None, :] < swa_lens[:, None]
+            swa_output, swa_lse = reference_attention_no_sink(
+                q, swa_kv, swa_valid, self.scale
+            )
+
+            expected = torch.empty_like(output)
+            merge_reference_attention_with_sink(
+                [comp_output, swa_output],
+                [comp_lse, swa_lse],
+                self.attn_sink,
+                expected,
+            )
+            _assert_sparse_mla_close(
+                name="compressed_decode",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                actual=output[:, : self.num_heads],
+                expected=expected[:, : self.num_heads],
+            )
 
     def _forward_sparse_mla_prefill_reference(
         self,
@@ -928,6 +1106,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         combined_indices: torch.Tensor,
         combined_lens: torch.Tensor,
         output: torch.Tensor,
+        state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         kv_flat = kv.reshape(-1, q.shape[-1])
         topk_chunk_size = min(
@@ -938,15 +1117,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             q.shape[0],
             sparse_mla_reference_query_chunk_size(),
         )
-        (
-            max_score_buffer,
-            denom_buffer,
-            output_buffer,
-        ) = current_workspace_manager().get_simultaneous(
-            ((query_chunk_size, self.num_heads), torch.float32),
-            ((query_chunk_size, self.num_heads), torch.float32),
-            ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
-        )
+        if state_buffers is None:
+            (
+                max_score_buffer,
+                denom_buffer,
+                output_buffer,
+            ) = current_workspace_manager().get_simultaneous(
+                ((query_chunk_size, self.num_heads), torch.float32),
+                ((query_chunk_size, self.num_heads), torch.float32),
+                ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
+            )
+        else:
+            max_score_buffer, denom_buffer, output_buffer = state_buffers
 
         for token_start in range(0, q.shape[0], query_chunk_size):
             token_end = min(token_start + query_chunk_size, q.shape[0])
@@ -984,6 +1166,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 subset_acc,
                 self.attn_sink,
                 output=output[token_start:token_end],
+            )
+            if output.shape[1] > self.num_heads:
+                output[token_start:token_end, self.num_heads :].zero_()
+
+        if _compare_sparse_mla_attention_enabled():
+            _assert_sparse_mla_finite(
+                name="prefill_q",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                tensor=q[:, :, : self.num_heads],
+            )
+            expected = torch.empty_like(output)
+            reference_sparse_mla_prefill(
+                q=q,
+                kv=kv,
+                combined_indices=combined_indices,
+                combined_lens=combined_lens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=expected,
+                topk_chunk_size=topk_chunk_size,
+                query_chunk_size=query_chunk_size,
+            )
+            _assert_sparse_mla_close(
+                name="prefill",
+                prefix=self.prefix,
+                compress_ratio=self.compress_ratio,
+                actual=output[:, : self.num_heads],
+                expected=expected[:, : self.num_heads],
             )
 
     def forward(
@@ -1242,9 +1453,34 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
 
         workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        reference_attention_enabled = is_sparse_mla_reference_attention_enabled(
+            q.device
+        )
+        if reference_attention_enabled:
+            query_chunk_size = min(
+                q.shape[0], sparse_mla_reference_query_chunk_size()
+            )
+            (
+                kv,
+                max_score_buffer,
+                denom_buffer,
+                output_buffer,
+            ) = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((query_chunk_size, self.num_heads), torch.float32),
+                ((query_chunk_size, self.num_heads), torch.float32),
+                ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
+            )
+            prefill_state_buffers = (
+                max_score_buffer,
+                denom_buffer,
+                output_buffer,
+            )
+        else:
+            kv = workspace_manager.get_simultaneous(
+                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            )[0]
+            prefill_state_buffers = None
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
@@ -1323,13 +1559,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     },
                 )
 
-            if is_sparse_mla_reference_attention_enabled(q.device):
+            if reference_attention_enabled:
                 self._forward_sparse_mla_prefill_reference(
                     q=q[query_start:query_end],
                     kv=kv[:chunk_size],
                     combined_indices=combined_indices,
                     combined_lens=combined_lens,
                     output=output[query_start:query_end],
+                    state_buffers=prefill_state_buffers,
                 )
                 continue
 

@@ -155,6 +155,16 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         self.w13_precision_config = None
         self.w2_precision_config = None
 
+
+    def _workspace_reserve_num_tokens(self) -> int:
+        scheduler_config = get_current_vllm_config().scheduler_config
+        candidates = [self.moe.max_num_tokens, self.max_capture_size or 0]
+        for attr in ("max_num_batched_tokens", "max_num_seqs"):
+            value = getattr(scheduler_config, attr, None)
+            if isinstance(value, int):
+                candidates.append(value)
+        return max(candidates)
+
     @property
     def skip_forward_padding(self) -> bool:
         # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
@@ -369,6 +379,14 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._maybe_init_expert_routing_tables(),
                 shared_experts=layer.shared_experts,
             )
+            if not self.is_monolithic:
+                self.moe_kernel.reserve_workspace(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.global_num_experts,
+                    layer.activation,
+                    max_num_tokens=self._workspace_reserve_num_tokens(),
+                )
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
@@ -480,6 +498,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Used for triton kernel precision configs
         self.w13_precision_config = None
         self.w2_precision_config = None
+
+
+    def _workspace_reserve_num_tokens(self) -> int:
+        scheduler_config = get_current_vllm_config().scheduler_config
+        candidates = [self.moe.max_num_tokens, self.max_capture_size or 0]
+        for attr in ("max_num_batched_tokens", "max_num_seqs"):
+            value = getattr(scheduler_config, attr, None)
+            if isinstance(value, int):
+                candidates.append(value)
+        return max(candidates)
 
     @property
     def skip_forward_padding(self) -> bool:
@@ -695,6 +723,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._maybe_init_expert_routing_tables(),
                 shared_experts=layer.shared_experts,
             )
+            if not self.is_monolithic:
+                self.moe_kernel.reserve_workspace(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.global_num_experts,
+                    layer.activation,
+                    max_num_tokens=self._workspace_reserve_num_tokens(),
+                )
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
