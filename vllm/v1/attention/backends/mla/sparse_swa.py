@@ -54,11 +54,10 @@ def _optional_env_flag(name: str) -> bool | None:
 
 
 def _is_sparse_mla_attention_dump_enabled() -> bool:
-    return (
-        _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
-        or _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV)
-        or False
-    )
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
+    if configured is not None:
+        return configured
+    return _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV) or False
 
 
 def _is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
