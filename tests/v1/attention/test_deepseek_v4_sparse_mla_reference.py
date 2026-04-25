@@ -333,7 +333,11 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
     denom[1, 2] = 0.0
     max_score[1, 2] = float("-inf")
     acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
-    sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
+    sink = torch.tensor(
+        [-0.5, 0.25, 1.0, -float("inf"), -float("inf")],
+        device="cuda",
+        dtype=torch.float32,
+    )
 
     output = torch.full((4, 5, 17), -7.0, device="cuda", dtype=torch.bfloat16)
     finish_sparse_mla_attention_with_sink(max_score, denom, acc, sink, output)
@@ -351,7 +355,7 @@ def test_triton_finish_with_sink_matches_finish_then_merge_reference() -> None:
     merge_reference_attention_with_sink(
         subset_outputs=[subset_output],
         subset_lses=[subset_lse],
-        attn_sink=sink,
+        attn_sink=sink[:3],
         output=expected,
     )
 
@@ -375,7 +379,11 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
     swa_max = torch.randn(4, 3, device="cuda", dtype=torch.float32)
     swa_denom = torch.rand(4, 3, device="cuda", dtype=torch.float32) + 0.1
     swa_acc = torch.randn(4, 3, 17, device="cuda", dtype=torch.float32)
-    sink = torch.tensor([-0.5, 0.25, 1.0], device="cuda", dtype=torch.float32)
+    sink = torch.tensor(
+        [-0.5, 0.25, 1.0, -float("inf"), -float("inf")],
+        device="cuda",
+        dtype=torch.float32,
+    )
 
     comp_denom[0, 1] = 0.0
     comp_max[0, 1] = float("-inf")
@@ -422,7 +430,7 @@ def test_triton_finish_two_states_with_sink_matches_finish_then_merge() -> None:
         subset0_lse=comp_lse,
         subset1_output=swa_output,
         subset1_lse=swa_lse,
-        attn_sink=sink,
+        attn_sink=sink[:3],
         output=expected,
     )
 
