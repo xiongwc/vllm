@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     merge_reference_attention_with_sink,
     new_reference_attention_state,
     reference_attention_no_sink,
+    reference_sparse_mla_prefill,
     sink_aware_reference_attention,
 )
 from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
@@ -304,6 +305,59 @@ def test_dequantize_global_slots_k_cache_fp8_ds_mla_layout() -> None:
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("topk_chunk_size", "query_chunk_size"),
+    [(1, 1), (2, 3), (5, 2)],
+)
+def test_reference_sparse_mla_prefill_matches_dense_golden(
+    topk_chunk_size: int,
+    query_chunk_size: int,
+) -> None:
+    torch.manual_seed(4)
+    scale = 0.375
+    q = torch.randn(4, 2, 3)
+    kv = torch.randn(2, 5, 3)
+    combined_indices = torch.tensor(
+        [
+            [0, 3, -1, 5, 3],
+            [4, -1, 2, 2, 1],
+            [-1, -1, -1, -1, -1],
+            [8, 0, 9, -1, 7],
+        ],
+        dtype=torch.int64,
+    )
+    combined_lens = torch.tensor([4, 3, 0, 5], dtype=torch.int32)
+    sink = torch.tensor([-0.5, 1.0])
+    output = torch.empty_like(q)
+
+    reference_sparse_mla_prefill(
+        q=q,
+        kv=kv,
+        combined_indices=combined_indices,
+        combined_lens=combined_lens,
+        scale=scale,
+        attn_sink=sink,
+        output=output,
+        topk_chunk_size=topk_chunk_size,
+        query_chunk_size=query_chunk_size,
+    )
+
+    kv_flat = kv.reshape(-1, q.shape[-1])
+    offsets = torch.arange(combined_indices.shape[-1])
+    valid_tokens = (offsets[None, :] < combined_lens[:, None]) & (
+        combined_indices >= 0
+    )
+    safe_indices = torch.where(
+        valid_tokens,
+        combined_indices,
+        torch.zeros((), dtype=combined_indices.dtype),
+    ).long()
+    gathered_kv = kv_flat[safe_indices]
+    expected = _golden_sink_attention(q, gathered_kv, valid_tokens, scale, sink)
+
+    torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 5])
