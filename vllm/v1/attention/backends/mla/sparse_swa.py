@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-import os
 from typing import ClassVar, cast
 
 import torch
@@ -15,6 +14,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
+)
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    is_sparse_mla_attention_dump_enabled,
+    is_sparse_mla_reference_attention_enabled,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
@@ -31,50 +34,6 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
-_TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
-_TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
-_LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
-_LEGACY_SM120_REFERENCE_ATTENTION_ENV = (
-    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
-)
-_ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
-_ENV_FALSE_VALUES = {"0", "false", "no", "off"}
-
-
-def _optional_env_flag(name: str) -> bool | None:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return None
-    value = raw_value.lower()
-    if value in _ENV_TRUE_VALUES:
-        return True
-    if value in _ENV_FALSE_VALUES:
-        return False
-    return None
-
-
-def _is_sparse_mla_attention_dump_enabled() -> bool:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
-    if configured is not None:
-        return configured
-    return _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV) or False
-
-
-def _is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
-    if configured is not None:
-        return configured
-    legacy_configured = _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
-    if legacy_configured is not None:
-        return legacy_configured
-    return _is_sm12x_device(device)
-
-
-def _is_sm12x_device(device: torch.device) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return torch.cuda.get_device_capability(index)[0] == 12
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -408,8 +367,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         if num_decode_tokens == 0:
             return out
         if (
-            _is_sparse_mla_attention_dump_enabled()
-            or _is_sparse_mla_reference_attention_enabled(self.device)
+            is_sparse_mla_attention_dump_enabled()
+            or is_sparse_mla_reference_attention_enabled(self.device)
         ):
             return out
         for layer_type in self._layer_types:

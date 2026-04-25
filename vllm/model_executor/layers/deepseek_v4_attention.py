@@ -6,7 +6,6 @@ DeepseekV4 MLA Attention Layer
 
 from dataclasses import dataclass
 import json
-import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -65,6 +64,13 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
 )
+from vllm.v1.attention.backends.mla.sparse_mla_env import (
+    is_sparse_mla_attention_dump_enabled,
+    is_sparse_mla_reference_attention_enabled,
+    sparse_mla_attention_dump_path,
+    sparse_mla_reference_query_chunk_size,
+    sparse_mla_reference_topk_chunk_size,
+)
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     accumulate_reference_attention_chunk,
     finish_reference_attention_no_sink,
@@ -82,90 +88,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
-
-_TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
-_TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
-_TRITON_MLA_SPARSE_DUMP_PATH_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
-_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE"
-_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
-
-_LEGACY_SM120_ATTENTION_DUMP_ENV = "VLLM_SM120_DUMP_DEEPSEEK_V4_ATTENTION"
-_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV = "VLLM_SM120_ATTENTION_DUMP_PATH"
-_LEGACY_SM120_REFERENCE_ATTENTION_ENV = (
-    "VLLM_SM120_REFERENCE_DEEPSEEK_V4_ATTENTION"
-)
-_LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV = "VLLM_SM120_REFERENCE_TOPK_CHUNK_SIZE"
-_LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV = "VLLM_SM120_REFERENCE_QUERY_CHUNK_SIZE"
-_ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
-_ENV_FALSE_VALUES = {"0", "false", "no", "off"}
-
-
-def _optional_env_flag(name: str) -> bool | None:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return None
-    value = raw_value.lower()
-    if value in _ENV_TRUE_VALUES:
-        return True
-    if value in _ENV_FALSE_VALUES:
-        return False
-    return None
-
-
-def _is_sm12x_device(device: torch.device) -> bool:
-    if not torch.cuda.is_available():
-        return False
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return torch.cuda.get_device_capability(index)[0] == 12
-
-
-def _is_sparse_mla_attention_dump_enabled() -> bool:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
-    if configured is not None:
-        return configured
-    return _optional_env_flag(_LEGACY_SM120_ATTENTION_DUMP_ENV) or False
-
-
-def _is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
-    if configured is not None:
-        return configured
-    legacy_configured = _optional_env_flag(_LEGACY_SM120_REFERENCE_ATTENTION_ENV)
-    if legacy_configured is not None:
-        return legacy_configured
-    return _is_sm12x_device(device)
-
-
-def _sparse_mla_attention_dump_path() -> str:
-    return (
-        os.getenv(_TRITON_MLA_SPARSE_DUMP_PATH_ENV)
-        or os.getenv(_LEGACY_SM120_ATTENTION_DUMP_PATH_ENV)
-        or "/tmp/deepseek_v4_triton_mla_sparse_dump.jsonl"
-    )
-
-
-def _sparse_mla_reference_topk_chunk_size() -> int:
-    raw_value = os.getenv(_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV) or os.getenv(
-        _LEGACY_SM120_REFERENCE_TOPK_CHUNK_ENV
-    )
-    if raw_value is None:
-        return 256
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return 256
-
-
-def _sparse_mla_reference_query_chunk_size() -> int:
-    raw_value = os.getenv(_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV) or os.getenv(
-        _LEGACY_SM120_REFERENCE_QUERY_CHUNK_ENV
-    )
-    if raw_value is None:
-        return 256
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return 256
 
 
 def _tensor_summary(tensor: torch.Tensor | None) -> dict[str, object] | None:
@@ -194,7 +116,7 @@ def _dump_sparse_mla_attention_state(
     attn_metadata: FlashMLASparseMetadata | None,
     fields: dict[str, object],
 ) -> None:
-    dump_path = _sparse_mla_attention_dump_path()
+    dump_path = sparse_mla_attention_dump_path()
     payload = {
         "phase": phase,
         "prefix": prefix,
@@ -273,7 +195,7 @@ def _write_sparse_mla_attention_state_if_enabled(
     attn_metadata: FlashMLASparseMetadata | None,
     fields: dict[str, object],
 ) -> None:
-    if not _is_sparse_mla_attention_dump_enabled():
+    if not is_sparse_mla_attention_dump_enabled():
         return
     _dump_sparse_mla_attention_state(
         phase=phase,
@@ -947,7 +869,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_topk = topk_indices.shape[-1]
         topk_chunk_size = min(
             compressed_topk,
-            _sparse_mla_reference_topk_chunk_size(),
+            sparse_mla_reference_topk_chunk_size(),
         )
         (compressed_kv, swa_kv) = current_workspace_manager().get_simultaneous(
             ((num_decode_tokens, topk_chunk_size, q.shape[-1]), torch.bfloat16),
@@ -1050,8 +972,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             scale=self.scale,
             attn_sink=self.attn_sink,
             output=output,
-            topk_chunk_size=_sparse_mla_reference_topk_chunk_size(),
-            query_chunk_size=_sparse_mla_reference_query_chunk_size(),
+            topk_chunk_size=sparse_mla_reference_topk_chunk_size(),
+            query_chunk_size=sparse_mla_reference_query_chunk_size(),
         )
 
     def forward(
@@ -1188,7 +1110,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             fields=decode_fields,
         )
 
-        if _is_sparse_mla_reference_attention_enabled(q.device):
+        if is_sparse_mla_reference_attention_enabled(q.device):
             if swa_only:
                 self._forward_sparse_mla_swa_decode_reference(
                     q=q,
@@ -1376,7 +1298,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 N,
             )
 
-            if _is_sparse_mla_attention_dump_enabled():
+            if is_sparse_mla_attention_dump_enabled():
                 _dump_sparse_mla_attention_state(
                     phase="prefill",
                     prefix=self.prefix,
@@ -1402,7 +1324,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     },
                 )
 
-            if _is_sparse_mla_reference_attention_enabled(q.device):
+            if is_sparse_mla_reference_attention_enabled(q.device):
                 self._forward_sparse_mla_prefill_reference(
                     q=q[query_start:query_end],
                     kv=kv[:chunk_size],
