@@ -218,8 +218,14 @@ def test_sparse_backend_decode_correctness(
         if not ok:
             pytest.skip(reason)
     elif backend_cls == FlashInferMLASparseBackend:
-        if not current_platform.has_device_capability(100):
-            pytest.skip("FlashInferMLASparseBackend requires SM 10.0 or higher")
+        capability = current_platform.get_device_capability()
+        if capability is None or not backend_cls.supports_compute_capability(
+            capability
+        ):
+            pytest.skip(
+                "FlashInferMLASparseBackend does not support "
+                f"{capability} on this platform"
+            )
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
