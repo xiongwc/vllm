@@ -449,10 +449,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         wo_a_fp8 = self.wo_a.weight
         wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = torch.empty(
-            (num_tokens, self.n_local_groups, self.o_lora_rank),
-            device=o.device,
-            dtype=torch.bfloat16,
+        (z,) = current_workspace_manager().get_simultaneous(
+            ((num_tokens, self.n_local_groups, self.o_lora_rank), torch.bfloat16),
         )
         torch.ops.vllm.deepseek_v4_fp8_einsum(
             o_fp8,
