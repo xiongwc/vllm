@@ -321,9 +321,10 @@ def accumulate_gathered_sparse_mla_attention_chunk(
     assert q.shape[0] == kv.shape[0]
     assert q.shape[-1] == kv.shape[-1]
     assert lens.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
     assert acc.dtype == torch.float32
@@ -338,7 +339,8 @@ def accumulate_gathered_sparse_mla_attention_chunk(
         assert slot_ids.shape == kv.shape[:2]
         assert slot_ids.is_cuda
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     num_candidates = kv.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, num_heads)
@@ -481,16 +483,18 @@ def accumulate_indexed_sparse_mla_attention_chunk(
     assert indices.shape[0] == q.shape[0]
     assert kv_flat.shape[-1] == q.shape[-1]
     assert lens.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
     assert acc.dtype == torch.float32
     assert q.is_cuda and kv_flat.is_cuda and indices.is_cuda and lens.is_cuda
     assert max_score.is_cuda and denom.is_cuda and acc.is_cuda
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     num_candidates = indices.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, num_heads)
@@ -662,9 +666,10 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
     assert slot_ids.dim() == 2
     assert slot_ids.shape[0] == q.shape[0]
     assert lens.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
     assert acc.dtype == torch.float32
@@ -678,7 +683,8 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk(
     quant_block_size = 64
     token_data_size = token_fp8_dim + token_bf16_dim * 2
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     num_candidates = slot_ids.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, num_heads)
@@ -868,9 +874,10 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
     assert slot_ids.dim() == 2
     assert slot_ids.shape[0] == q.shape[0]
     assert lens.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert head_block_size in (1, 2, 4)
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
@@ -885,7 +892,8 @@ def accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
     quant_block_size = 64
     token_data_size = token_fp8_dim + token_bf16_dim * 2
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     num_candidates = slot_ids.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
@@ -1065,9 +1073,10 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
     assert seq_lens.shape[0] == q.shape[0]
     assert gather_lens.shape[0] == q.shape[0]
     assert block_table.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
     assert acc.dtype == torch.float32
@@ -1082,7 +1091,8 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk(
     quant_block_size = 64
     token_data_size = token_fp8_dim + token_bf16_dim * 2
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, num_heads)
     _accumulate_fp8ds_paged_attention_chunk_kernel[grid](
@@ -1270,9 +1280,10 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
     assert seq_lens.shape[0] == q.shape[0]
     assert gather_lens.shape[0] == q.shape[0]
     assert block_table.shape[0] == q.shape[0]
-    assert max_score.shape == q.shape[:2]
-    assert denom.shape == q.shape[:2]
-    assert acc.shape == q.shape
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
     assert head_block_size in (1, 2, 4)
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
@@ -1288,7 +1299,8 @@ def accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
     quant_block_size = 64
     token_data_size = token_fp8_dim + token_bf16_dim * 2
 
-    num_tokens, num_heads, head_dim = q.shape
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
     _accumulate_fp8ds_paged_attention_chunk_multihead_kernel[grid](
