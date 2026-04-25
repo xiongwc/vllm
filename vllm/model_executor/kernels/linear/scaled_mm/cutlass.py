@@ -29,6 +29,20 @@ from .ScaledMMLinearKernel import (
 )
 
 
+def _is_sm12x_compute_capability(compute_capability) -> bool:
+    if compute_capability is None:
+        return current_platform.is_device_capability_family(120)
+
+    if isinstance(compute_capability, tuple):
+        return compute_capability[0] == 12
+
+    to_int = getattr(compute_capability, "to_int", None)
+    if callable(to_int):
+        return to_int() // 10 == 12
+
+    return int(compute_capability) // 10 == 12
+
+
 class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
     def is_supported(
@@ -199,6 +213,9 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     @classmethod
     def is_supported(cls, compute_capability=None):
+        if _is_sm12x_compute_capability(compute_capability):
+            return False, "CUTLASS block-scaled FP8 GEMM is not supported on SM12x."
+
         if not CUTLASS_BLOCK_FP8_SUPPORTED:
             return (
                 False,

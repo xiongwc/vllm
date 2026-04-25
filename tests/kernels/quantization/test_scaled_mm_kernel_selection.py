@@ -15,12 +15,14 @@ import torch
 from vllm.model_executor.kernels.linear import (
     AiterInt8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
+    CutlassFp8BlockScaledMMKernel,
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
     init_int8_linear_kernel,
     register_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm import cutlass as cutlass_scaled_mm
 from vllm.platforms import PlatformEnum
 
 pytestmark = pytest.mark.cpu_test
@@ -69,6 +71,35 @@ def test_aiter_kernel_implements_is_supported():
     assert reason is None or isinstance(reason, str), "reason should be str or None"
     # On CPU, it should return False with a reason about requiring ROCm
     # This validates the method works correctly even on non-ROCm platforms
+
+
+@pytest.mark.parametrize("compute_capability", [(12, 0), (12, 1), 120, 121])
+def test_cutlass_fp8_block_scaled_mm_rejects_sm12x(
+    compute_capability, monkeypatch
+):
+    monkeypatch.setattr(cutlass_scaled_mm, "CUTLASS_BLOCK_FP8_SUPPORTED", True)
+
+    supported, reason = CutlassFp8BlockScaledMMKernel.is_supported(
+        compute_capability
+    )
+
+    assert not supported
+    assert reason is not None
+    assert "SM12x" in reason
+
+
+@pytest.mark.parametrize("compute_capability", [(9, 0), 90, (10, 0), 100])
+def test_cutlass_fp8_block_scaled_mm_allows_non_sm12x_when_available(
+    compute_capability, monkeypatch
+):
+    monkeypatch.setattr(cutlass_scaled_mm, "CUTLASS_BLOCK_FP8_SUPPORTED", True)
+
+    supported, reason = CutlassFp8BlockScaledMMKernel.is_supported(
+        compute_capability
+    )
+
+    assert supported
+    assert reason is None
 
 
 def test_cpu_kernel_accepts_all_configs():
