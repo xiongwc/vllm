@@ -522,20 +522,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
-            # Reserve _forward_prefill's bf16-gather workspace; the dummy
-            # run returns before mla_attn runs, so without this the shared
-            # workspace locks below the real prefill size.
-            sub = self.mla_attn
-            swa_only = sub.compress_ratio <= 1
-            N = (
-                0
-                if swa_only
-                else (sub.max_model_len + sub.compress_ratio - 1) // sub.compress_ratio
-            )
-            M = N + sub.window_size + sub.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
             out.zero_()
             return
 
