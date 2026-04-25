@@ -8,6 +8,9 @@ import pytest
 import torch
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.model_executor.layers.deepseek_v4_attention import (
+    _deepseek_v4_fp8_einsum_config,
+)
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
@@ -69,6 +72,25 @@ def test_triton_sparse_mla_decode_head_block_size(
     assert (
         sparse_mla_decode_head_block_size(num_decode_tokens)
         == expected_head_block_size
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability_major", "expected_recipe", "expected_tma_aligned"),
+    [
+        (9, (1, 128, 128), False),
+        (10, (1, 1, 128), True),
+        (12, (1, 128, 128), False),
+    ],
+)
+def test_deepseek_v4_fp8_einsum_config_for_sm12x(
+    capability_major: int,
+    expected_recipe: tuple[int, int, int],
+    expected_tma_aligned: bool,
+) -> None:
+    assert _deepseek_v4_fp8_einsum_config(capability_major) == (
+        expected_recipe,
+        expected_tma_aligned,
     )
 
 

@@ -116,6 +116,14 @@ def _optional_int(value: object) -> int | None:
     return int(value) if value is not None else None
 
 
+def _deepseek_v4_fp8_einsum_config(
+    capability_major: int,
+) -> tuple[tuple[int, int, int], bool]:
+    if capability_major == 10:
+        return (1, 1, 128), True
+    return (1, 128, 128), False
+
+
 def _dump_sparse_mla_attention_state(
     phase: str,
     prefix: str,
@@ -412,8 +420,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         cap = current_platform.get_device_capability()
         assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-        self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
-        self._tma_aligned_scales = cap.major >= 10
+        self._einsum_recipe, self._tma_aligned_scales = (
+            _deepseek_v4_fp8_einsum_config(cap.major)
+        )
 
         self.rotary_emb = mla_modules.rotary_emb
         self.indexer_rotary_emb = mla_modules.indexer_rotary_emb
