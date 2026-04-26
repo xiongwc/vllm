@@ -309,7 +309,7 @@ __global__ void fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel(
 
     if (!is_rope_lane) {
       // ── NoPE lane: UE8M0 FP8 quant ───────────────────────────────────────
-      uint8_t out_bytes[kElemsPerLane];
+      alignas(16) uint8_t out_bytes[kElemsPerLane];
 #pragma unroll
       for (int i = 0; i < kElemsPerLane; i++) {
         float scaled = elements[i] * inv_scale;
