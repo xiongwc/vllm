@@ -875,7 +875,7 @@ def w8a8_triton_block_scaled_mm(
         # (M=1) and short MTP-style draft batches. Specialize only the M<=8
         # case to keep blast radius small; larger M keeps the previous default.
         if M <= 8:
-            block_m, num_stages = 16, 3
+            block_m, num_stages = 16, (2 if current_platform.is_rocm() else 3)
         else:
             block_m, num_stages = 64, 2
         config = {
