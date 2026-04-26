@@ -5,7 +5,6 @@ import pytest
 
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH,
-    SM120_SHORT_ROW_TOPK_MAX_ROWS,
     SM120_SHORT_ROW_TOPK_MAX_WIDTH,
     _should_use_sm120_short_row_topk_decode,
 )
@@ -15,8 +14,9 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     ("topk_tokens", "logits_width", "num_rows", "is_cuda_sm120", "expected"),
     [
         (512, SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH, 32, True, True),
-        (512, 8192, SM120_SHORT_ROW_TOPK_MAX_ROWS, True, True),
-        (512, 8192, SM120_SHORT_ROW_TOPK_MAX_ROWS + 1, True, False),
+        (512, 8192, 16, True, True),
+        (512, 8192, 32, True, True),
+        (512, 12288, 32, True, False),
         (512, SM120_SHORT_ROW_TOPK_MAX_WIDTH, 1, True, False),
         (512, 4096, 1, False, False),
         (2048, 4096, 1, True, False),

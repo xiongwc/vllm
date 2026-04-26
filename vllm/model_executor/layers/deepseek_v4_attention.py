@@ -28,6 +28,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    sparse_prefill_combined_topk_size,
 )
 from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
     deepseek_v4_sm12_fp8_einsum,
@@ -1241,12 +1242,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
+                local_topk_indices = self.topk_indices_buffer[:num_decode_tokens]
                 global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
+                    local_topk_indices,
                     swa_metadata.token_to_req_indices,
                     attn_metadata.block_table[:num_decodes],
                     block_size,
                     is_valid,
+                    global_topk_indices=local_topk_indices,
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
@@ -1430,6 +1433,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             swa_only=swa_only,
         )
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
+        max_query_chunk_tokens = 0
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+            max_query_chunk_tokens = max(
+                max_query_chunk_tokens, int(query_end - query_start)
+            )
+        combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
 
         workspace_manager = current_workspace_manager()
         reference_attention_enabled = is_sparse_mla_reference_attention_enabled(
@@ -1441,11 +1458,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             (
                 kv,
+                combined_indices_buffer,
+                combined_lens_buffer,
                 max_score_buffer,
                 denom_buffer,
                 output_buffer,
             ) = workspace_manager.get_simultaneous(
                 ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((max_query_chunk_tokens, combined_topk), torch.int32),
+                ((max_query_chunk_tokens,), torch.int32),
                 ((query_chunk_size, self.num_heads), torch.float32),
                 ((query_chunk_size, self.num_heads), torch.float32),
                 ((query_chunk_size, self.num_heads, q.shape[-1]), torch.float32),
@@ -1456,9 +1477,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output_buffer,
             )
         else:
-            kv = workspace_manager.get_simultaneous(
+            (
+                kv,
+                combined_indices_buffer,
+                combined_lens_buffer,
+            ) = workspace_manager.get_simultaneous(
                 ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )[0]
+                ((max_query_chunk_tokens, combined_topk), torch.int32),
+                ((max_query_chunk_tokens,), torch.int32),
+            )
             prefill_state_buffers = None
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
@@ -1498,6 +1525,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
+            query_tokens = query_end - query_start
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
                 query_start_loc[
@@ -1510,6 +1538,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 top_k,
                 M,
                 N,
+                combined_indices=combined_indices_buffer[:query_tokens],
+                combined_lens=combined_lens_buffer[:query_tokens],
             )
 
             if is_sparse_mla_attention_dump_enabled():

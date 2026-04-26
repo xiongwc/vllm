@@ -37,7 +37,6 @@ logger = init_logger(__name__)
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
 SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
-SM120_SHORT_ROW_TOPK_MAX_ROWS = 16
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -53,10 +52,7 @@ def _should_use_sm120_short_row_topk_decode(
         return False
     if logits_width <= SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH:
         return True
-    return (
-        logits_width < SM120_SHORT_ROW_TOPK_MAX_WIDTH
-        and num_rows <= SM120_SHORT_ROW_TOPK_MAX_ROWS
-    )
+    return logits_width < SM120_SHORT_ROW_TOPK_MAX_WIDTH
 
 
 def _use_sm120_short_row_topk_decode(

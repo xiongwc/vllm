@@ -48,6 +48,10 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
+from vllm.v1.attention.ops.deepseek_v4_ops import (
+    combine_topk_swa_indices,
+    compute_global_topk_indices_and_lens,
+)
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -802,6 +806,105 @@ def test_sparse_indexer_max_logits_bytes_honors_env_override(monkeypatch):
 
     assert sparse_indexer_max_logits_bytes(is_sm12x=True) == 384 * 1024 * 1024
     assert sparse_indexer_max_logits_bytes(is_sm12x=False) == 384 * 1024 * 1024
+
+
+def test_compute_global_topk_indices_supports_in_place_output():
+    device = torch.device(DEVICE_TYPE)
+    block_size = 4
+    topk_indices = torch.tensor(
+        [[0, 3, 4, -1], [2, 5, -1, -1], [1, 7, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    token_to_req = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
+    block_table = torch.tensor(
+        [[10, 11, 12], [20, 21, 22]], dtype=torch.int32, device=device
+    )
+    is_valid = torch.tensor([True, True, False], device=device)
+
+    expected_indices = torch.tensor(
+        [
+            [40, 43, 44, -1],
+            [82, 85, -1, -1],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    expected_lens = torch.tensor([3, 2, 0], dtype=torch.int32, device=device)
+
+    out, lens = compute_global_topk_indices_and_lens(
+        topk_indices,
+        token_to_req,
+        block_table,
+        block_size,
+        is_valid,
+    )
+    torch.testing.assert_close(out, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(lens, expected_lens, rtol=0, atol=0)
+
+    in_place = topk_indices.clone()
+    provided_lens = torch.empty(3, dtype=torch.int32, device=device)
+    out, lens = compute_global_topk_indices_and_lens(
+        in_place,
+        token_to_req,
+        block_table,
+        block_size,
+        is_valid,
+        global_topk_indices=in_place,
+        topk_lens=provided_lens,
+    )
+    assert out is in_place
+    assert lens is provided_lens
+    torch.testing.assert_close(in_place, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(provided_lens, expected_lens, rtol=0, atol=0)
+
+
+def test_combine_topk_swa_indices_supports_workspace_outputs():
+    device = torch.device(DEVICE_TYPE)
+    num_tokens = 6
+    topk = 4
+    window_size = 8
+    topk_indices = (
+        torch.arange(num_tokens * topk, dtype=torch.int32, device=device)
+        .reshape(num_tokens, topk)
+        .remainder(5)
+    )
+    query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([20], dtype=torch.int32, device=device)
+    gather_lens = torch.tensor([8], dtype=torch.int32, device=device)
+
+    expected_indices, expected_lens = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        4,
+        topk,
+        16,
+        12,
+    )
+    workspace_indices = torch.empty_like(expected_indices)
+    workspace_lens = torch.empty_like(expected_lens)
+    actual_indices, actual_lens = combine_topk_swa_indices(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        4,
+        topk,
+        16,
+        12,
+        combined_indices=workspace_indices,
+        combined_lens=workspace_lens,
+    )
+
+    assert actual_indices.data_ptr() == workspace_indices.data_ptr()
+    assert actual_lens.data_ptr() == workspace_lens.data_ptr()
+    torch.testing.assert_close(actual_indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(actual_lens, expected_lens, rtol=0, atol=0)
 
 
 def test_split_indexer_prefill_chunks_single_request_overflow():
