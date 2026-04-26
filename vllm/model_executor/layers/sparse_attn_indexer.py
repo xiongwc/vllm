@@ -35,9 +35,41 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH = 4096
+SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
+SM120_SHORT_ROW_TOPK_MAX_ROWS = 16
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _should_use_sm120_short_row_topk_decode(
+    topk_tokens: int,
+    logits_width: int,
+    num_rows: int,
+    is_cuda_sm120: bool,
+) -> bool:
+    if not is_cuda_sm120 or topk_tokens != 512:
+        return False
+    if logits_width <= SM120_SHORT_ROW_TOPK_ALWAYS_WIDTH:
+        return True
+    return (
+        logits_width < SM120_SHORT_ROW_TOPK_MAX_WIDTH
+        and num_rows <= SM120_SHORT_ROW_TOPK_MAX_ROWS
+    )
+
+
+def _use_sm120_short_row_topk_decode(
+    logits: torch.Tensor,
+    topk_tokens: int,
+) -> bool:
+    return _should_use_sm120_short_row_topk_decode(
+        topk_tokens,
+        logits.shape[1],
+        logits.shape[0],
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120),
+    )
 
 
 def _gather_workspace_shapes(
@@ -320,7 +352,18 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 2048):
+        if _use_sm120_short_row_topk_decode(logits, topk_tokens):
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+        elif current_platform.is_cuda() and topk_tokens in (512, 2048):
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
