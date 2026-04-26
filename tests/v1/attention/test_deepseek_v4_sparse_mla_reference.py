@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
+    matmul_sparse_mla_attention_with_sink,
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
     sparse_mla_decode_head_block_size,
@@ -1586,6 +1587,46 @@ def test_triton_fp8ds_global_paged_attention_with_sink_direct_matches_state_path
         attn_sink=sink,
         output=actual,
         head_block_size=head_block_size,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_matmul_sparse_mla_attention_with_sink_matches_reference() -> None:
+    torch.manual_seed(41)
+    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(2, 7, 512, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor(
+        [
+            [True, True, False, True, False, True, True],
+            [False, True, True, False, True, False, False],
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    sink = torch.linspace(-0.25, 0.25, 5, device="cuda")
+    scale = 0.0625
+
+    expected = torch.empty(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    sink_aware_reference_attention(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        sink,
+        expected,
+    )
+
+    actual = torch.empty_like(expected)
+    matmul_sparse_mla_attention_with_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        sink,
+        actual,
+        num_heads=5,
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

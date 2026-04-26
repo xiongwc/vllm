@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
     VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
     VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1306,6 +1307,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
         os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
+        else os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "").lower()
+        in ("1", "true", "yes", "on")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

@@ -74,6 +74,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_sparse_mla_attention_dump_enabled,
     is_sparse_mla_reference_attention_enabled,
     sparse_mla_attention_dump_path,
+    sparse_mla_matmul_decode_enabled,
     sparse_mla_reference_query_chunk_size,
     sparse_mla_reference_topk_chunk_size,
 )
@@ -85,6 +86,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
+    matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
@@ -1039,6 +1041,78 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_slot_ids = topk_indices[:, 0, :]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        if (
+            compressed_topk <= topk_chunk_size
+            and sparse_mla_matmul_decode_enabled()
+            and not _compare_sparse_mla_attention_enabled()
+        ):
+            total_candidates = compressed_topk + max_swa_len
+            (
+                comp_kv,
+                swa_kv,
+                combined_kv,
+                valid_tokens,
+            ) = current_workspace_manager().get_simultaneous(
+                (
+                    (num_decode_tokens, compressed_topk, q.shape[-1]),
+                    torch.bfloat16,
+                ),
+                (
+                    (num_decode_tokens, max_swa_len, q.shape[-1]),
+                    torch.bfloat16,
+                ),
+                (
+                    (num_decode_tokens, total_candidates, q.shape[-1]),
+                    torch.bfloat16,
+                ),
+                ((num_decode_tokens, total_candidates), torch.bool),
+            )
+            dequantize_global_slots_k_cache(
+                comp_kv,
+                compressed_k_cache,
+                compressed_slot_ids,
+                compressed_block_size,
+            )
+            dequantize_and_gather_k_cache(
+                swa_kv,
+                swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                offset=0,
+            )
+            combined_kv[:, :compressed_topk].copy_(comp_kv)
+            combined_kv[:, compressed_topk:total_candidates].copy_(swa_kv)
+
+            comp_offsets = torch.arange(
+                compressed_topk,
+                device=q.device,
+                dtype=topk_lens.dtype,
+            )
+            swa_offsets = torch.arange(
+                max_swa_len,
+                device=q.device,
+                dtype=swa_lens.dtype,
+            )
+            valid_tokens[:, :compressed_topk].copy_(
+                (comp_offsets[None, :] < topk_lens[:, None])
+                & (compressed_slot_ids >= 0)
+            )
+            valid_tokens[:, compressed_topk:total_candidates].copy_(
+                swa_offsets[None, :] < swa_lens[:, None]
+            )
+            matmul_sparse_mla_attention_with_sink(
+                q=q,
+                kv=combined_kv,
+                valid_tokens=valid_tokens,
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output,
+                num_heads=self.num_heads,
+            )
+            return
+
         if (
             compressed_topk <= topk_chunk_size
             and not _compare_sparse_mla_attention_enabled()

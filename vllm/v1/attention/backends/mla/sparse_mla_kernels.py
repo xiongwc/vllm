@@ -234,6 +234,65 @@ def merge_sparse_mla_subset_with_sink(
     )
 
 
+def matmul_sparse_mla_attention_with_sink(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    num_heads: int | None = None,
+) -> None:
+    """Compute sink-aware sparse MLA over materialized BF16 KV.
+
+    This path intentionally dequantizes/gathers KV once and then reuses it
+    across all heads with batched matrix multiplications. It is useful for the
+    SM12x decode fallback where the direct Triton reference kernel otherwise
+    repeats fp8_ds_mla dequantization once per head group.
+    """
+    if q.dim() == 4:
+        assert q.shape[1] == 1
+        q = q[:, 0]
+
+    assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
+    assert kv.dim() == 3, f"Expected kv shape [T, K, D], got {kv.shape}"
+    assert valid_tokens.shape == kv.shape[:2]
+    assert q.shape[0] == kv.shape[0]
+    assert q.shape[-1] == kv.shape[-1]
+    assert output.shape[0] == q.shape[0]
+    assert output.shape[2] == q.shape[-1]
+    assert q.is_cuda and kv.is_cuda and valid_tokens.is_cuda
+    assert attn_sink.is_cuda and output.is_cuda
+
+    active_heads = num_heads if num_heads is not None else output.shape[1]
+    assert active_heads <= q.shape[1]
+    assert active_heads <= output.shape[1]
+    assert active_heads <= attn_sink.shape[0]
+
+    q_active = q[:, :active_heads]
+    if q_active.dtype != kv.dtype:
+        q_active = q_active.to(kv.dtype)
+
+    scores = torch.bmm(q_active, kv.transpose(1, 2)).float()
+    scores.mul_(scale)
+    scores.masked_fill_(~valid_tokens[:, None, :], float("-inf"))
+    scores = torch.cat(
+        (
+            scores,
+            attn_sink[:active_heads][None, :, None].expand(
+                q.shape[0], active_heads, 1
+            ),
+        ),
+        dim=2,
+    )
+
+    weights = torch.softmax(scores, dim=-1)[..., : kv.shape[1]]
+    result = torch.bmm(weights.to(kv.dtype), kv)
+    output[:, :active_heads].copy_(result.to(output.dtype))
+    if output.shape[1] > active_heads:
+        output[:, active_heads:].zero_()
+
+
 @triton.jit
 def _accumulate_gathered_attention_chunk_kernel(
     q_ptr,
