@@ -8,6 +8,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+import vllm.utils.deep_gemm as deep_gemm_utils
 from tests.v1.attention.test_mla_backends import (
     BATCH_SPECS,
     BatchSpec,
@@ -72,6 +73,64 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_sm120_fp8_mqa_logits_head_chunk_size_caps_large_scores():
+    assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(128, 128, 32) == 8
+    assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(8192, 8192, 32) == 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_mqa_logits_torch_reference_streams_head_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(0)
+    seq_len, seq_len_kv, num_heads, head_dim = 9, 17, 32, 32
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_SM120_MQA_LOGITS_MAX_SCORE_BYTES",
+        seq_len * seq_len_kv * 4,
+    )
+
+    q = torch.randn(
+        seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 3
+    cu_seqlen_ke = torch.minimum(
+        torch.arange(seq_len, device="cuda", dtype=torch.int32) + 4,
+        torch.full((seq_len,), seq_len_kv, device="cuda", dtype=torch.int32),
+    )
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_amax = kv.abs().float().amax(dim=1, keepdim=True).clamp(1e-4)
+    kv_scale = (kv_amax / 448.0).squeeze(1).contiguous()
+    kv_fp8 = (kv * (1.0 / kv_scale[:, None])).to(torch.float8_e4m3fn)
+
+    logits = deep_gemm_utils._fp8_mqa_logits_torch_reference(
+        (q_fp8, None),
+        (kv_fp8, kv_scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=True,
+    )
+
+    kv_dequant = kv_fp8.float() * kv_scale[:, None]
+    score = torch.einsum("mhd,nd->hmn", q_fp8.float(), kv_dequant)
+    ref_logits = (score.relu() * weights.transpose(0, 1).unsqueeze(-1)).sum(dim=0)
+    offsets = torch.arange(seq_len_kv, device="cuda")
+    valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+        offsets[None, :] < cu_seqlen_ke[:, None]
+    )
+    ref_logits = ref_logits.masked_fill(~valid, float("-inf"))
+
+    assert torch.equal(torch.isneginf(logits), torch.isneginf(ref_logits))
+    finite = torch.isfinite(ref_logits)
+    assert (logits[finite] - ref_logits[finite]).abs().max() < 1e-4
 
 
 def _float_to_e8m0_truncate(f: float) -> float:

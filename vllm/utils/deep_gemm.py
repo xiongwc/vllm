@@ -343,6 +343,23 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 128 * 1024 * 1024
+
+
+def _fp8_mqa_logits_head_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    num_heads: int,
+) -> int:
+    # The SM120 torch fallback is used on long prefill paths where materializing
+    # [head_chunk, M, N] scores can otherwise allocate multiple GiB. Keep the
+    # transient score tensor bounded, while still using larger head chunks for
+    # short prompts where they are faster.
+    score_elems_per_head = max(1, seq_len * seq_len_kv)
+    max_heads = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_head * 4)
+    return max(1, min(8, num_heads, max_heads))
+
+
 def _fp8_mqa_logits_torch_reference(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -356,23 +373,28 @@ def _fp8_mqa_logits_torch_reference(
         raise NotImplementedError("SM120 MQA logits fallback only supports FP8 Q")
 
     k_values, k_scales = kv
-    q_f32 = q_values.to(torch.float32)
-    k_f32 = k_values.to(torch.float32) * k_scales.reshape(-1, 1).to(torch.float32)
+    k_f32 = k_values.to(torch.float32)
+    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
     k_t = k_f32.transpose(0, 1).contiguous()
 
-    seq_len, num_heads, _ = q_f32.shape
+    seq_len, num_heads, _ = q_values.shape
     seq_len_kv = k_f32.shape[0]
     logits = torch.zeros(
         (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
     )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(
+        seq_len, seq_len_kv, num_heads
+    )
 
-    # Avoid materializing the full [H, M, N] score tensor for all heads.
-    for head_start in range(0, num_heads, 8):
-        head_end = min(head_start + 8, num_heads)
-        q_chunk = q_f32[:, head_start:head_end, :].transpose(0, 1).contiguous()
+    for head_start in range(0, num_heads, head_chunk_size):
+        head_end = min(head_start + head_chunk_size, num_heads)
+        q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+        q_chunk = q_chunk.transpose(0, 1).contiguous()
         scores = torch.matmul(q_chunk, k_t)
         head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
-        logits += (scores.relu() * head_weights).sum(dim=0)
+        scores.relu_()
+        scores.mul_(head_weights)
+        logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
 
     if clean_logits:
         offsets = torch.arange(seq_len_kv, device=q_values.device)
