@@ -6641,6 +6641,7 @@ class GPUModelRunner(
                         # index), which holds for MLA backends but NOT for
                         # standard attention backends whose shape starts with
                         # a K/V dimension of size 2.
+                        assert kv_cache_shape[inv_order[0]] == kernel_num_blocks
                         dtype_size = get_dtype_size(dtype)
                         page_stride = kv_cache_spec.page_size_bytes // dtype_size
                         strides = list(torch.empty(kv_cache_shape).stride())

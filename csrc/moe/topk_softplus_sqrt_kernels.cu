@@ -60,15 +60,6 @@ __device__ __forceinline__ float toFloat(T value) {
   }
 }
 
-#define FINAL_MASK 0xffffffff
-template <typename T>
-__inline__ __device__ T warpReduceSum(T val) {
-#pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
-    val += __shfl_xor_sync(FINAL_MASK, val, mask, 32);
-  return val;
-}
-
 // ====================== TopK softplus_sqrt things
 // ===============================
 
@@ -273,7 +264,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     }
     // Compute per-thread scale (using warp reduction when renormalizing).
     if (renormalize) {
-      selected_sum = warpReduceSum(selected_sum);
+#pragma unroll
+      for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+        selected_sum +=
+            VLLM_SHFL_XOR_SYNC_WIDTH(selected_sum, mask, THREADS_PER_ROW);
+      }
     }
     float scale = static_cast<float>(routed_scaling_factor);
     if (renormalize) {

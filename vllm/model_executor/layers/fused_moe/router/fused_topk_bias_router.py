@@ -68,6 +68,12 @@ def vllm_topk_softplus_sqrt(
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, ...]:
+    idx_dtype = topk_indices.dtype
+    if input_tokens is not None and input_tokens.dtype != idx_dtype:
+        input_tokens = input_tokens.to(idx_dtype)
+    if hash_indices_table is not None and hash_indices_table.dtype != idx_dtype:
+        hash_indices_table = hash_indices_table.to(idx_dtype)
+
     ops.topk_hash_softplus_sqrt(
         topk_weights,
         topk_indices,
@@ -211,7 +217,7 @@ def fused_topk_bias(
         scores_for_choice = scores.view(-1, n_routed_experts)
     # For batch invariance, use sorted=True to ensure deterministic expert selection
     if hash_indices_table is not None:
-        topk_indices = hash_indices_table[input_tokens]
+        topk_indices = hash_indices_table[input_tokens].to(topk_ids.dtype)
     else:
         use_sorted = envs.VLLM_BATCH_INVARIANT
         topk_indices = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=use_sorted)[

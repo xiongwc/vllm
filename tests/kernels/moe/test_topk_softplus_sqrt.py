@@ -134,6 +134,7 @@ def test_fused_topk_softplus_sqrt(
 @pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half, torch.float32])
+@pytest.mark.parametrize("indices_type", [None, torch.int64])
 def test_fused_topk_softplus_sqrt_hash(
     num_tokens: int,
     hidden_size: int,
@@ -142,6 +143,7 @@ def test_fused_topk_softplus_sqrt_hash(
     renormalize: bool,
     routed_scaling_factor: float,
     dtype: torch.dtype,
+    indices_type: torch.dtype | None,
 ):
     torch.manual_seed(0)
     vocab_size = 1024
@@ -175,11 +177,14 @@ def test_fused_topk_softplus_sqrt_hash(
         input_tokens=input_ids,
         hash_indices_table=hash_indices_table,
         routed_scaling_factor=routed_scaling_factor,
+        indices_type=indices_type,
     )
 
     sorted_ref_ids, idx_ref = topk_ids_ref.sort(dim=-1)
     sorted_ids, idx_ops = topk_ids.sort(dim=-1)
-    torch.testing.assert_close(sorted_ref_ids, sorted_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        sorted_ref_ids.to(sorted_ids.dtype), sorted_ids, atol=0, rtol=0
+    )
 
     sorted_w_ref = topk_weights_ref.gather(1, idx_ref)
     sorted_w = topk_weights.gather(1, idx_ops)
