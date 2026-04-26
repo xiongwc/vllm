@@ -67,7 +67,16 @@ def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("num_decode_tokens", "expected_head_block_size"),
-    [(0, 1), (1, 1), (2, 2), (4, 2), (7, 2), (8, 4), (32, 4)],
+    [
+        (0, 1),
+        (1, 1),
+        (4, 1),
+        (5, 2),
+        (8, 2),
+        (15, 2),
+        (16, 4),
+        (32, 4),
+    ],
 )
 def test_triton_sparse_mla_decode_head_block_size(
     num_decode_tokens: int,
@@ -106,7 +115,7 @@ def test_triton_sparse_mla_decode_head_block_size_ignores_invalid_env_override(
         configured_head_block_size,
     )
 
-    assert sparse_mla_decode_head_block_size(8) == 4
+    assert sparse_mla_decode_head_block_size(8) == 2
 
 
 @pytest.mark.parametrize(

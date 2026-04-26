@@ -21,9 +21,9 @@ def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
     configured_head_block_size = sparse_mla_reference_head_block_size()
     if configured_head_block_size is not None:
         return configured_head_block_size
-    if num_decode_tokens <= 1:
+    if num_decode_tokens <= 4:
         return 1
-    if num_decode_tokens < 8:
+    if num_decode_tokens < 16:
         return 2
     return 4
 
