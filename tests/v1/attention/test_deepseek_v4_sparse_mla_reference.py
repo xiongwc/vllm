@@ -75,6 +75,12 @@ class _FakeWorkspaceManager:
         return tuple(torch.empty(shape, dtype=dtype) for shape, dtype in specs)
 
 
+def _assert_fp8_einsum_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # The Triton fallback and DeepGEMM reference both accumulate in FP32, but
+    # their reduction orders are not bit-identical before the final BF16 store.
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=3e-4)
+
+
 def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
 
@@ -338,11 +344,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
     out_rank = 1024
     recipe = (1, 128, 128)
 
-    a_backing = torch.empty(
+    a_backing = torch.randn(
         (num_groups, num_tokens, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     a = a_backing.transpose(0, 1)
     a_scale_backing = torch.empty(
         (num_groups, num_tokens, hidden_size // 128),
@@ -350,11 +356,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
         dtype=torch.float32,
     ).uniform_(0.01, 0.02)
     a_scale = a_scale_backing.transpose(0, 1)
-    b_flat = torch.empty(
+    b_flat = torch.randn(
         (num_groups * out_rank, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     b = b_flat.view(num_groups, out_rank, hidden_size)
     if use_e8m0_scale:
         scale_choices = torch.tensor(
@@ -404,7 +410,7 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
         list(recipe),
     )
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_fp8_einsum_close(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
@@ -416,11 +422,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> Non
     out_rank = 1024
     recipe = (1, 128, 128)
 
-    a_backing = torch.empty(
+    a_backing = torch.randn(
         (num_groups, num_tokens, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     a = a_backing.transpose(0, 1)
     a_scale_backing = torch.empty(
         (num_groups, num_tokens, hidden_size // 128),
@@ -428,11 +434,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> Non
         dtype=torch.float32,
     ).uniform_(0.01, 0.02)
     a_scale = a_scale_backing.transpose(0, 1)
-    b_flat = torch.empty(
+    b_flat = torch.randn(
         (num_groups * out_rank, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     b = b_flat.view(num_groups, out_rank, hidden_size)
     b_scale_flat = torch.empty(
         (num_groups * (out_rank // 128), hidden_size // 128),
@@ -450,7 +456,7 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> Non
     fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), expected, recipe=recipe)
     deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, actual)
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_fp8_einsum_close(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
@@ -464,11 +470,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_supports_tp_local_group_counts(
     out_rank = 1024
     recipe = (1, 128, 128)
 
-    a_backing = torch.empty(
+    a_backing = torch.randn(
         (num_groups, num_tokens, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     a = a_backing.transpose(0, 1)
     a_scale_backing = torch.empty(
         (num_groups, num_tokens, hidden_size // 128),
@@ -476,11 +482,11 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_supports_tp_local_group_counts(
         dtype=torch.float32,
     ).uniform_(0.01, 0.02)
     a_scale = a_scale_backing.transpose(0, 1)
-    b_flat = torch.empty(
+    b_flat = torch.randn(
         (num_groups * out_rank, hidden_size),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
-    )
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
     b = b_flat.view(num_groups, out_rank, hidden_size)
     b_scale_flat = torch.empty(
         (num_groups * (out_rank // 128), hidden_size // 128),
@@ -498,7 +504,7 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_supports_tp_local_group_counts(
     fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), expected, recipe=recipe)
     deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, actual)
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    _assert_fp8_einsum_close(actual, expected)
 
 
 def _masked_scores(

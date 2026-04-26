@@ -343,7 +343,7 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
-_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 128 * 1024 * 1024
+_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
 
 
 def _fp8_mqa_logits_head_chunk_size(
@@ -358,6 +358,16 @@ def _fp8_mqa_logits_head_chunk_size(
     score_elems_per_head = max(1, seq_len * seq_len_kv)
     max_heads = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_head * 4)
     return max(1, min(8, num_heads, max_heads))
+
+
+def _fp8_mqa_logits_k_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    head_chunk_size: int,
+) -> int:
+    score_elems_per_key = max(1, seq_len * head_chunk_size)
+    max_keys = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_key * 4)
+    return max(1, min(seq_len_kv, max_keys))
 
 
 def _fp8_mqa_logits_torch_reference(
@@ -390,11 +400,18 @@ def _fp8_mqa_logits_torch_reference(
         head_end = min(head_start + head_chunk_size, num_heads)
         q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
         q_chunk = q_chunk.transpose(0, 1).contiguous()
-        scores = torch.matmul(q_chunk, k_t)
         head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
-        scores.relu_()
-        scores.mul_(head_weights)
-        logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
+        k_chunk_size = _fp8_mqa_logits_k_chunk_size(
+            seq_len, seq_len_kv, head_end - head_start
+        )
+        for k_start in range(0, seq_len_kv, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, seq_len_kv)
+            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            scores.relu_()
+            scores.mul_(head_weights)
+            logits[:, k_start:k_end].add_(
+                scores[0] if scores.shape[0] == 1 else scores.sum(dim=0)
+            )
 
     if clean_logits:
         offsets = torch.arange(seq_len_kv, device=q_values.device)

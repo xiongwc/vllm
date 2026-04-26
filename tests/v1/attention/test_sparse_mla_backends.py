@@ -75,9 +75,11 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 DEVICE_TYPE = current_platform.device_type
 
 
-def test_sm120_fp8_mqa_logits_head_chunk_size_caps_large_scores():
+def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
     assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(128, 128, 32) == 8
     assert deep_gemm_utils._fp8_mqa_logits_head_chunk_size(8192, 8192, 32) == 1
+    assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(128, 128, 8) == 128
+    assert deep_gemm_utils._fp8_mqa_logits_k_chunk_size(8192, 8192, 1) == 2048
 
 
 @pytest.mark.skipif(
@@ -91,7 +93,7 @@ def test_sm120_fp8_mqa_logits_torch_reference_streams_head_chunks(
     monkeypatch.setattr(
         deep_gemm_utils,
         "_SM120_MQA_LOGITS_MAX_SCORE_BYTES",
-        seq_len * seq_len_kv * 4,
+        seq_len * 5 * 4,
     )
 
     q = torch.randn(

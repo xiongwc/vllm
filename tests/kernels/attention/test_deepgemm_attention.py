@@ -10,10 +10,11 @@ from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
     calc_diff,
     fp8_fp4_mqa_logits,
-    fp8_mqa_logits,
-    fp8_paged_mqa_logits,
     get_num_sms,
     get_paged_mqa_logits_metadata,
+)
+from vllm.utils.deep_gemm import (
+    fp8_fp4_paged_mqa_logits as fp8_paged_mqa_logits,
 )
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
@@ -91,6 +92,13 @@ def _ref_fp8_mqa_logits(
     return logits
 
 
+def _supports_deepgemm_optimized_mqa_logits() -> bool:
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(100)
+    )
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
@@ -141,7 +149,7 @@ def test_sm120_fp8_mqa_logits_reference_fallback():
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @pytest.mark.skipif(
-    not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
+    not _supports_deepgemm_optimized_mqa_logits(), reason="SM90 and SM100 only"
 )
 @pytest.mark.parametrize("clean_logits", [True, False])
 def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
@@ -176,7 +184,7 @@ def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
                 logits = fp8_fp4_mqa_logits(
-                    q_fp8, kv_fp8, weights, ks, ke, clean_logits=clean_logits
+                    (q_fp8, None), kv_fp8, weights, ks, ke, clean_logits=clean_logits
                 )
 
                 ref_logits = _ref_fp8_mqa_logits(
@@ -251,7 +259,7 @@ def _ref_fp8_paged_mqa_logits(
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @pytest.mark.skipif(
-    not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
+    not _supports_deepgemm_optimized_mqa_logits(), reason="SM90 and SM100 only"
 )
 @pytest.mark.parametrize("clean_logits", [True, False])
 def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
@@ -306,14 +314,17 @@ def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
+                deepgemm_context_lens = (
+                    context_lens[:, None].expand(-1, next_n).contiguous()
+                )
                 schedule_metadata = get_paged_mqa_logits_metadata(
-                    context_lens, blocksize, get_num_sms()
+                    deepgemm_context_lens, blocksize, get_num_sms()
                 )
                 logits = fp8_paged_mqa_logits(
-                    q_fp8,
+                    (q_fp8, None),
                     kv_cache_fp8,
                     weights,
-                    context_lens,
+                    deepgemm_context_lens,
                     block_tables,
                     schedule_metadata,
                     max_model_len,
