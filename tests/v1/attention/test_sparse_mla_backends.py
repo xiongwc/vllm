@@ -135,6 +135,73 @@ def test_sm120_fp8_mqa_logits_torch_reference_streams_head_chunks(
     assert (logits[finite] - ref_logits[finite]).abs().max() < 1e-4
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_mqa_logits_topk_streams_k_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(1)
+    seq_len, seq_len_kv, num_heads, head_dim = 11, 23, 16, 32
+    topk_tokens = 5
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_SM120_MQA_LOGITS_MAX_SCORE_BYTES",
+        seq_len * 5 * 4,
+    )
+
+    q = torch.randn(
+        seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 4
+    valid_lens = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 7
+    cu_seqlen_ke = torch.minimum(
+        cu_seqlen_ks + valid_lens,
+        torch.full((seq_len,), seq_len_kv, device="cuda", dtype=torch.int32),
+    )
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_amax = kv.abs().float().amax(dim=1, keepdim=True).clamp(1e-4)
+    kv_scale = (kv_amax / 448.0).squeeze(1).contiguous()
+    kv_fp8 = (kv * (1.0 / kv_scale[:, None])).to(torch.float8_e4m3fn)
+
+    topk_indices = deep_gemm_utils._fp8_mqa_logits_topk_torch(
+        (q_fp8, None),
+        (kv_fp8, kv_scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_tokens,
+    )
+
+    logits = deep_gemm_utils._fp8_mqa_logits_torch_reference(
+        (q_fp8, None),
+        (kv_fp8, kv_scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=True,
+    )
+    expected = torch.full_like(topk_indices, -1)
+    for row in range(seq_len):
+        valid_count = int((cu_seqlen_ke[row] - cu_seqlen_ks[row]).item())
+        row_topk = min(topk_tokens, valid_count)
+        if row_topk > 0:
+            expected[row, :row_topk] = logits[row].topk(row_topk).indices.to(
+                torch.int32
+            )
+
+    for row in range(seq_len):
+        valid_count = int((cu_seqlen_ke[row] - cu_seqlen_ks[row]).item())
+        row_topk = min(topk_tokens, valid_count)
+        assert set(topk_indices[row, :row_topk].tolist()) == set(
+            expected[row, :row_topk].tolist()
+        )
+        assert torch.all(topk_indices[row, row_topk:] == -1)
+
+
 def _float_to_e8m0_truncate(f: float) -> float:
     """Simulate SM100's float -> e8m0 -> bf16 scale conversion.
     e8m0 format only stores the exponent (power of 2).

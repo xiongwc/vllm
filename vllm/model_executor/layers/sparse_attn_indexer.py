@@ -11,6 +11,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
+    fp8_fp4_mqa_topk_indices,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
 )
@@ -248,6 +249,19 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            topk_indices = topk_indices_buffer[
+                chunk.token_start : chunk.token_end, :topk_tokens
+            ]
+            if fp8_fp4_mqa_topk_indices(
+                (q_slice_cast, q_scale_slice),
+                (k_quant_cast, k_scale_cast),
+                weights[chunk.token_start : chunk.token_end],
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                topk_indices,
+            ):
+                continue
+
             logits = fp8_fp4_mqa_logits(
                 (q_slice_cast, q_scale_slice),
                 (k_quant_cast, k_scale_cast),
@@ -257,10 +271,6 @@ def sparse_attn_indexer(
                 clean_logits=False,
             )
             num_rows = logits.shape[0]
-
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
             if current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
