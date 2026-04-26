@@ -14,6 +14,7 @@ from tests.kernels.quant_utils import (
 from vllm.config import VllmConfig
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _get_default_w8a8_block_fp8_config,
     per_token_group_quant_fp8,
     w8a8_triton_block_scaled_mm,
 )
@@ -60,6 +61,19 @@ pytest.importorskip("torch.cuda")
 @pytest.fixture(autouse=True)
 def setup_cuda():
     torch.set_default_device("cuda")
+
+
+def test_w8a8_block_fp8_default_config_extends_low_m_tiles_on_sm12x():
+    cfg = _get_default_w8a8_block_fp8_config(32, 128, 128)
+    capability = current_platform.get_device_capability()
+    capability_major = getattr(capability, "major", capability[0])
+
+    if capability_major == 12:
+        assert cfg["BLOCK_SIZE_M"] == 16
+        assert cfg["num_stages"] == 3
+    else:
+        assert cfg["BLOCK_SIZE_M"] == 64
+        assert cfg["num_stages"] == 2
 
 
 @pytest.mark.skipif(
