@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -30,6 +30,20 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+
+def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
+    configured_mb = os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB")
+    if configured_mb is not None:
+        return int(configured_mb) * 1024 * 1024
+
+    if is_sm12x is None:
+        is_sm12x = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        )
+    default_mb = 256 if is_sm12x else 512
+    return default_mb * 1024 * 1024
 
 
 @triton.jit
@@ -516,7 +530,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
-            max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+            max_logits_bytes = sparse_indexer_max_logits_bytes()
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None

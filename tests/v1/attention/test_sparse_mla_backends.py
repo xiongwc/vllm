@@ -42,7 +42,10 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
+from vllm.v1.attention.backends.mla.indexer import (
+    sparse_indexer_max_logits_bytes,
+    split_indexer_prefill_chunks,
+)
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
 
@@ -785,6 +788,20 @@ def test_split_indexer_prefill_chunks(
         max_logits_bytes,
     )
     assert out == expected
+
+
+def test_sparse_indexer_max_logits_bytes_uses_sm12x_safe_default(monkeypatch):
+    monkeypatch.delenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", raising=False)
+
+    assert sparse_indexer_max_logits_bytes(is_sm12x=True) == 256 * 1024 * 1024
+    assert sparse_indexer_max_logits_bytes(is_sm12x=False) == 512 * 1024 * 1024
+
+
+def test_sparse_indexer_max_logits_bytes_honors_env_override(monkeypatch):
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "384")
+
+    assert sparse_indexer_max_logits_bytes(is_sm12x=True) == 384 * 1024 * 1024
+    assert sparse_indexer_max_logits_bytes(is_sm12x=False) == 384 * 1024 * 1024
 
 
 def test_split_indexer_prefill_chunks_single_request_overflow():

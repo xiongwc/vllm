@@ -124,6 +124,23 @@ def _optional_int(value: object) -> int | None:
     return int(value) if value is not None else None
 
 
+def _sparse_mla_prefill_workspace_bounds(
+    seq_lens_cpu: torch.Tensor,
+    gather_lens_cpu: torch.Tensor,
+    compress_ratio: int,
+    swa_only: bool,
+) -> tuple[int, int]:
+    if seq_lens_cpu.numel() == 0:
+        return 0, 0
+
+    max_gather_len = int(gather_lens_cpu.max().item())
+    if swa_only:
+        return 0, max_gather_len
+
+    compressed_region_size = int((seq_lens_cpu // compress_ratio).max().item())
+    return compressed_region_size, compressed_region_size + max_gather_len
+
+
 def _deepseek_v4_fp8_einsum_config(
     capability_major: int,
 ) -> tuple[tuple[int, int, int], bool]:
@@ -1570,8 +1587,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
         gather_lens = swa_metadata.prefill_gather_lens
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        gather_lens_cpu = swa_metadata.prefill_gather_lens_cpu
         assert seq_lens is not None
         assert gather_lens is not None
+        assert seq_lens_cpu is not None
+        assert gather_lens_cpu is not None
 
         # Derive prefill-local token offsets from the full query_start_loc_cpu.
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
@@ -1590,18 +1611,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
             top_k = topk_indices.shape[-1]
-            # Compressed region must fit the full compressed pool (seq_len //
-            # compress_ratio), not just top_k. top_k bounds how many indices
-            # the indexer selects, not the pool size it indexes into.
-            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
         else:
             # NOTE(woosuk): topk_indices will not be used for SWA-only layers.
             assert self.topk_indices_buffer is not None
             topk_indices = self.topk_indices_buffer[num_decode_tokens:]
             top_k = 0
-            N = 0
 
-        M = N + self.window_size + self.max_num_batched_tokens
+        N, M = _sparse_mla_prefill_workspace_bounds(
+            seq_lens_cpu=seq_lens_cpu,
+            gather_lens_cpu=gather_lens_cpu,
+            compress_ratio=self.compress_ratio,
+            swa_only=swa_only,
+        )
         num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
 
         workspace_manager = current_workspace_manager()

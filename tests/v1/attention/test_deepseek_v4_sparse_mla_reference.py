@@ -10,6 +10,7 @@ import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.model_executor.layers.deepseek_v4_attention import (
     _deepseek_v4_fp8_einsum_config,
+    _sparse_mla_prefill_workspace_bounds,
     deepseek_v4_fp8_einsum,
 )
 from vllm.utils.deep_gemm import fp8_einsum
@@ -69,6 +70,36 @@ def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
 
     assert sparse_mla_reference_topk_chunk_size() == 512
+
+
+def test_sparse_mla_prefill_workspace_bounds_use_active_prefill_lengths() -> None:
+    seq_lens_cpu = torch.tensor([15_000, 2_048], dtype=torch.int32)
+    gather_lens_cpu = torch.tensor([15_000, 2_048], dtype=torch.int32)
+
+    compressed_region_size, row_stride = _sparse_mla_prefill_workspace_bounds(
+        seq_lens_cpu=seq_lens_cpu,
+        gather_lens_cpu=gather_lens_cpu,
+        compress_ratio=4,
+        swa_only=False,
+    )
+
+    assert compressed_region_size == 3_750
+    assert row_stride == 18_750
+
+
+def test_sparse_mla_prefill_workspace_bounds_for_swa_only() -> None:
+    seq_lens_cpu = torch.tensor([15_000], dtype=torch.int32)
+    gather_lens_cpu = torch.tensor([15_000], dtype=torch.int32)
+
+    compressed_region_size, row_stride = _sparse_mla_prefill_workspace_bounds(
+        seq_lens_cpu=seq_lens_cpu,
+        gather_lens_cpu=gather_lens_cpu,
+        compress_ratio=1,
+        swa_only=True,
+    )
+
+    assert compressed_region_size == 0
+    assert row_stride == 15_000
 
 
 @pytest.mark.parametrize(
