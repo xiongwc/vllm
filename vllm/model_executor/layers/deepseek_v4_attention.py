@@ -25,6 +25,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    dequantize_combined_sparse_mla_decode_kv,
     dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
@@ -1048,42 +1049,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         ):
             total_candidates = compressed_topk + max_swa_len
             (
-                comp_kv,
-                swa_kv,
                 combined_kv,
                 valid_tokens,
             ) = current_workspace_manager().get_simultaneous(
-                (
-                    (num_decode_tokens, compressed_topk, q.shape[-1]),
-                    torch.bfloat16,
-                ),
-                (
-                    (num_decode_tokens, max_swa_len, q.shape[-1]),
-                    torch.bfloat16,
-                ),
                 (
                     (num_decode_tokens, total_candidates, q.shape[-1]),
                     torch.bfloat16,
                 ),
                 ((num_decode_tokens, total_candidates), torch.bool),
             )
-            dequantize_global_slots_k_cache(
-                comp_kv,
+            dequantize_combined_sparse_mla_decode_kv(
+                combined_kv,
                 compressed_k_cache,
                 compressed_slot_ids,
                 compressed_block_size,
-            )
-            dequantize_and_gather_k_cache(
-                swa_kv,
                 swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                offset=0,
+                swa_metadata.seq_lens[:num_decodes],
+                swa_lens,
+                swa_metadata.block_table[:num_decodes],
+                swa_metadata.block_size,
             )
-            combined_kv[:, :compressed_topk].copy_(comp_kv)
-            combined_kv[:, compressed_topk:total_candidates].copy_(swa_kv)
 
             comp_offsets = torch.arange(
                 compressed_topk,

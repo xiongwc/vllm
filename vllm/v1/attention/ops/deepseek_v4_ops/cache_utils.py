@@ -410,7 +410,11 @@ def _dequantize_global_slots_k_kernel(
     bf16_offsets = tl.arange(0, 64)
     bf16_cache_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
     bf16_vals = tl.load(bf16_cache_ptr + bf16_offsets, mask=bf16_offsets < bf16_dim)
-    tl.store(output_row + fp8_dim + bf16_offsets, bf16_vals, mask=bf16_offsets < bf16_dim)
+    tl.store(
+        output_row + fp8_dim + bf16_offsets,
+        bf16_vals,
+        mask=bf16_offsets < bf16_dim,
+    )
 
 
 def dequantize_global_slots_k_cache(
@@ -423,7 +427,9 @@ def dequantize_global_slots_k_cache(
     if slot_ids.dim() == 3:
         assert slot_ids.shape[1] == 1
         slot_ids = slot_ids[:, 0, :]
-    assert slot_ids.dim() == 2, f"slot_ids must be [num_tokens, topk], got {slot_ids.shape}"
+    assert slot_ids.dim() == 2, (
+        f"slot_ids must be [num_tokens, topk], got {slot_ids.shape}"
+    )
     assert out.shape[:2] == slot_ids.shape
     assert out.shape[-1] == 512
     assert out.dtype == torch.bfloat16
@@ -453,6 +459,45 @@ def dequantize_global_slots_k_cache(
         quant_block=QUANT_BLOCK_SIZE,
         output_dim=512,
         BLOCK_D=triton.next_power_of_2(512),
+    )
+
+
+def dequantize_combined_sparse_mla_decode_kv(
+    combined_kv: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    compressed_slot_ids: torch.Tensor,
+    compressed_block_size: int,
+    swa_k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    swa_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    swa_block_size: int,
+) -> None:
+    """Fill `[compressed, SWA]` decode candidates into one output buffer."""
+    assert combined_kv.dim() == 3
+    compressed_topk = compressed_slot_ids.shape[-1]
+    assert combined_kv.shape[0] == compressed_slot_ids.shape[0]
+    assert combined_kv.shape[-1] == 512
+    assert combined_kv.dtype == torch.bfloat16
+    assert combined_kv.shape[1] >= compressed_topk
+
+    dequantize_global_slots_k_cache(
+        combined_kv[:, :compressed_topk],
+        compressed_k_cache,
+        compressed_slot_ids,
+        compressed_block_size,
+    )
+    swa_out = combined_kv[:, compressed_topk:]
+    if swa_out.shape[1] == 0:
+        return
+    dequantize_and_gather_k_cache(
+        swa_out,
+        swa_k_cache,
+        seq_lens=seq_lens,
+        gather_lens=swa_lens,
+        block_table=block_table,
+        block_size=swa_block_size,
+        offset=0,
     )
 
 

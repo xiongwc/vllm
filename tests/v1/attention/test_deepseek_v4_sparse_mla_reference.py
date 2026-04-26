@@ -48,7 +48,11 @@ from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     sink_aware_reference_attention,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
-from vllm.v1.attention.ops.deepseek_v4_ops import dequantize_global_slots_k_cache
+from vllm.v1.attention.ops.deepseek_v4_ops import (
+    dequantize_and_gather_k_cache,
+    dequantize_combined_sparse_mla_decode_kv,
+    dequantize_global_slots_k_cache,
+)
 from vllm.v1.attention.ops.deepseek_v4_ops.fp8_einsum import (
     deepseek_v4_sm12_fp8_einsum,
 )
@@ -949,6 +953,89 @@ def test_dequantize_global_slots_k_cache_fp8_ds_mla_layout() -> None:
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_dequantize_combined_sparse_mla_decode_kv_writes_direct_views() -> None:
+    compressed_block_size = 4
+    swa_block_size = 4
+    compressed_cache = torch.zeros(
+        2,
+        compressed_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    swa_cache = torch.zeros(
+        3,
+        swa_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    for slot in (0, 3, 4):
+        _write_fp8_ds_mla_token(compressed_cache, slot, compressed_block_size)
+    for slot in (0, 1, 2, 3, 4):
+        _write_fp8_ds_mla_token(swa_cache, slot, swa_block_size)
+
+    compressed_slot_ids = torch.tensor(
+        [[0, 3, -1], [4, 0, 3]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([5, 7], dtype=torch.int32, device="cuda")
+    swa_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor(
+        [[0, 1, 2], [2, 0, 1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    combined = torch.full(
+        (2, 6, 512),
+        -7,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    dequantize_combined_sparse_mla_decode_kv(
+        combined,
+        compressed_cache,
+        compressed_slot_ids,
+        compressed_block_size,
+        swa_cache,
+        seq_lens,
+        swa_lens,
+        block_table,
+        swa_block_size,
+    )
+
+    expected_comp = torch.empty(2, 3, 512, dtype=torch.bfloat16, device="cuda")
+    expected_swa = torch.full(
+        (2, 3, 512),
+        -7,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    dequantize_global_slots_k_cache(
+        expected_comp,
+        compressed_cache,
+        compressed_slot_ids,
+        compressed_block_size,
+    )
+    dequantize_and_gather_k_cache(
+        expected_swa,
+        swa_cache,
+        seq_lens=seq_lens,
+        gather_lens=swa_lens,
+        block_table=block_table,
+        block_size=swa_block_size,
+        offset=0,
+    )
+    expected = torch.full_like(combined, -7)
+    expected[:, :3].copy_(expected_comp)
+    expected[:, 3:].copy_(expected_swa)
+
+    torch.testing.assert_close(combined.float(), expected.float(), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
