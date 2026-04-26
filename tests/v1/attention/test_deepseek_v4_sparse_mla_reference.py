@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_gathered_sparse_mla_attention_chunk,
     accumulate_indexed_sparse_mla_attention_chunk,
+    build_combined_sparse_mla_decode_valid_mask,
     finish_gathered_sparse_mla_attention,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
@@ -1717,6 +1718,39 @@ def test_matmul_sparse_mla_attention_with_sink_matches_reference() -> None:
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_build_combined_sparse_mla_decode_valid_mask_matches_torch() -> None:
+    compressed_slot_ids = torch.tensor(
+        [
+            [7, 4, -1, 9, 11],
+            [2, -1, 3, 8, 10],
+            [-1, -1, -1, -1, -1],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk_lens = torch.tensor([4, 3, 0], device="cuda", dtype=torch.int32)
+    swa_lens = torch.tensor([3, 1, 0], device="cuda", dtype=torch.int32)
+    valid_tokens = torch.empty(3, 9, device="cuda", dtype=torch.bool)
+
+    build_combined_sparse_mla_decode_valid_mask(
+        valid_tokens,
+        compressed_slot_ids,
+        topk_lens,
+        swa_lens,
+    )
+
+    comp_offsets = torch.arange(5, device="cuda", dtype=torch.int32)
+    swa_offsets = torch.arange(4, device="cuda", dtype=torch.int32)
+    expected = torch.empty_like(valid_tokens)
+    expected[:, :5] = (comp_offsets[None, :] < topk_lens[:, None]) & (
+        compressed_slot_ids >= 0
+    )
+    expected[:, 5:] = swa_offsets[None, :] < swa_lens[:, None]
+
+    torch.testing.assert_close(valid_tokens, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")

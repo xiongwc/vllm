@@ -234,6 +234,84 @@ def merge_sparse_mla_subset_with_sink(
     )
 
 
+@triton.jit
+def _build_combined_decode_valid_mask_kernel(
+    output_ptr,
+    slot_ids_ptr,
+    topk_lens_ptr,
+    swa_lens_ptr,
+    stride_output_t: tl.constexpr,
+    stride_output_c: tl.constexpr,
+    stride_slot_t: tl.constexpr,
+    stride_slot_c: tl.constexpr,
+    num_compressed_candidates: tl.constexpr,
+    num_candidates: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_C)
+    candidate_mask = offsets < num_candidates
+
+    topk_lens = tl.load(topk_lens_ptr + token_idx)
+    swa_lens = tl.load(swa_lens_ptr + token_idx)
+    is_compressed = offsets < num_compressed_candidates
+    swa_offsets = offsets - num_compressed_candidates
+    slot_ids = tl.load(
+        slot_ids_ptr + token_idx * stride_slot_t + offsets * stride_slot_c,
+        mask=is_compressed,
+        other=-1,
+    )
+    valid_compressed = is_compressed & (offsets < topk_lens) & (slot_ids >= 0)
+    valid_swa = (~is_compressed) & (swa_offsets < swa_lens)
+    valid = valid_compressed | valid_swa
+    tl.store(
+        output_ptr + token_idx * stride_output_t + offsets * stride_output_c,
+        valid,
+        mask=candidate_mask,
+    )
+
+
+def build_combined_sparse_mla_decode_valid_mask(
+    output: torch.Tensor,
+    compressed_slot_ids: torch.Tensor,
+    topk_lens: torch.Tensor,
+    swa_lens: torch.Tensor,
+) -> None:
+    """Build `[compressed, SWA]` validity mask for SM12x decode fallback."""
+    if compressed_slot_ids.dim() == 3:
+        assert compressed_slot_ids.shape[1] == 1
+        compressed_slot_ids = compressed_slot_ids[:, 0, :]
+
+    assert output.dim() == 2
+    assert output.dtype == torch.bool
+    assert compressed_slot_ids.dim() == 2
+    assert output.shape[0] == compressed_slot_ids.shape[0]
+    assert output.shape[0] == topk_lens.shape[0]
+    assert output.shape[0] == swa_lens.shape[0]
+    assert output.shape[1] >= compressed_slot_ids.shape[1]
+    assert output.is_cuda
+    assert compressed_slot_ids.is_cuda
+    assert topk_lens.is_cuda
+    assert swa_lens.is_cuda
+
+    num_candidates = output.shape[1]
+    block_c = triton.next_power_of_2(num_candidates)
+    _build_combined_decode_valid_mask_kernel[(output.shape[0],)](
+        output,
+        compressed_slot_ids,
+        topk_lens,
+        swa_lens,
+        output.stride(0),
+        output.stride(1),
+        compressed_slot_ids.stride(0),
+        compressed_slot_ids.stride(1),
+        compressed_slot_ids.shape[1],
+        num_candidates,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+
+
 def matmul_sparse_mla_attention_with_sink(
     q: torch.Tensor,
     kv: torch.Tensor,

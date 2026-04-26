@@ -83,6 +83,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
+    build_combined_sparse_mla_decode_valid_mask,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
@@ -1070,22 +1071,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 swa_metadata.block_size,
             )
 
-            comp_offsets = torch.arange(
-                compressed_topk,
-                device=q.device,
-                dtype=topk_lens.dtype,
-            )
-            swa_offsets = torch.arange(
-                max_swa_len,
-                device=q.device,
-                dtype=swa_lens.dtype,
-            )
-            valid_tokens[:, :compressed_topk].copy_(
-                (comp_offsets[None, :] < topk_lens[:, None])
-                & (compressed_slot_ids >= 0)
-            )
-            valid_tokens[:, compressed_topk:total_candidates].copy_(
-                swa_offsets[None, :] < swa_lens[:, None]
+            build_combined_sparse_mla_decode_valid_mask(
+                valid_tokens,
+                compressed_slot_ids,
+                topk_lens,
+                swa_lens,
             )
             matmul_sparse_mla_attention_with_sink(
                 q=q,
