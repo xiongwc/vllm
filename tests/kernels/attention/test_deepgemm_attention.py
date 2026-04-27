@@ -103,7 +103,7 @@ def _supports_deepgemm_optimized_mqa_logits() -> bool:
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_fp8_mqa_logits_reference_fallback():
+def test_sm120_fp8_mqa_logits_torch_path():
     torch.manual_seed(0)
 
     seq_len, seq_len_kv, num_heads, head_dim = 9, 17, 32, 32

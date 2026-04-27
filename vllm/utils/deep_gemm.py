@@ -351,7 +351,7 @@ def _fp8_mqa_logits_head_chunk_size(
     seq_len_kv: int,
     num_heads: int,
 ) -> int:
-    # The SM120 torch fallback is used on long prefill paths where materializing
+    # The SM120 torch path is used on long prefill paths where materializing
     # [head_chunk, M, N] scores can otherwise allocate multiple GiB. Keep the
     # transient score tensor bounded, while still using larger head chunks for
     # short prompts where they are faster.
@@ -370,7 +370,7 @@ def _fp8_mqa_logits_k_chunk_size(
     return max(1, min(seq_len_kv, max_keys))
 
 
-def _fp8_mqa_logits_torch_reference(
+def _fp8_mqa_logits_torch(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -380,7 +380,7 @@ def _fp8_mqa_logits_torch_reference(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if q_scale is not None:
-        raise NotImplementedError("SM120 MQA logits fallback only supports FP8 Q")
+        raise NotImplementedError("SM120 MQA logits torch path only supports FP8 Q")
 
     k_values, k_scales = kv
     k_f32 = k_values.to(torch.float32)
@@ -434,7 +434,7 @@ def _fp8_mqa_logits_topk_torch(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if q_scale is not None:
-        raise NotImplementedError("SM120 MQA top-k fallback only supports FP8 Q")
+        raise NotImplementedError("SM120 MQA top-k torch path only supports FP8 Q")
 
     k_values, k_scales = kv
     k_f32 = k_values.to(torch.float32)
@@ -565,7 +565,7 @@ def fp8_fp4_mqa_logits(
     """
     _lazy_init()
     if current_platform.is_device_capability_family(120) and q[1] is None:
-        return _fp8_mqa_logits_torch_reference(
+        return _fp8_mqa_logits_torch(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
     if _fp8_fp4_mqa_logits_impl is None:
