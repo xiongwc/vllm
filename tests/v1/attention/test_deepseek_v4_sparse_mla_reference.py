@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness tests for the DeepSeek V4 sparse MLA reference path."""
+"""Correctness tests for the DeepSeek V4 Triton sparse MLA path and reference oracle."""
 
 from types import SimpleNamespace
 
@@ -27,8 +27,8 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseMetadataBuilder,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    disable_sparse_mla_reference_cudagraphs_if_enabled,
-    sparse_mla_reference_topk_chunk_size,
+    disable_triton_sparse_mla_cudagraphs_if_enabled,
+    triton_sparse_mla_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk,
@@ -81,7 +81,7 @@ class _FakeWorkspaceManager:
 
 
 def _assert_fp8_einsum_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    # The Triton fallback and DeepGEMM reference both accumulate in FP32, but
+    # The Triton path and DeepGEMM reference both accumulate in FP32, but
     # their reduction orders are not bit-identical before the final BF16 store.
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=3e-4)
 
@@ -147,7 +147,7 @@ def test_wo_a_output_allocation_uses_workspace_outside_compile(monkeypatch) -> N
 def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
 
-    assert sparse_mla_reference_topk_chunk_size() == 512
+    assert triton_sparse_mla_topk_chunk_size() == 512
 
 
 def test_sparse_mla_prefill_workspace_bounds_use_active_prefill_lengths() -> None:
@@ -233,7 +233,7 @@ def test_triton_sparse_mla_decode_head_block_size_ignores_invalid_env_override(
     assert sparse_mla_decode_head_block_size(8) == 2
 
 
-def test_swa_mtp_decode_reference_uses_global_swa_slots(monkeypatch) -> None:
+def test_swa_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
     captured: dict[str, torch.Tensor] = {}
 
     def fail_paged_attention_with_sink_multihead(**kwargs) -> None:
@@ -285,7 +285,7 @@ def test_swa_mtp_decode_reference_uses_global_swa_slots(monkeypatch) -> None:
         token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32),
     )
 
-    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_swa_decode_reference(
+    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_swa_decode_triton(
         attention,
         q=torch.empty((6, 1, 2, 512), dtype=torch.bfloat16),
         swa_k_cache=torch.empty((1, 256, 584), dtype=torch.uint8),
@@ -297,7 +297,7 @@ def test_swa_mtp_decode_reference_uses_global_swa_slots(monkeypatch) -> None:
     torch.testing.assert_close(captured["lens"], swa_lens)
 
 
-def test_compressed_mtp_decode_reference_uses_global_swa_slots(monkeypatch) -> None:
+def test_compressed_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
     captured: list[torch.Tensor] = []
 
     def fail_matmul_decode(**kwargs) -> None:
@@ -357,7 +357,7 @@ def test_compressed_mtp_decode_reference_uses_global_swa_slots(monkeypatch) -> N
         token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32),
     )
 
-    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_compressed_decode_reference(
+    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_compressed_decode_triton(
         attention,
         q=torch.empty((6, 1, 2, 512), dtype=torch.bfloat16),
         compressed_k_cache=torch.empty((1, 64, 584), dtype=torch.uint8),
@@ -2364,7 +2364,7 @@ def test_chunked_reference_accumulation_matches_one_shot(chunk_size: int) -> Non
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
 
-def test_triton_sparse_mla_fallback_allows_cudagraph_support_by_default(
+def test_triton_sparse_mla_path_allows_cudagraph_support_by_default(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
@@ -2408,7 +2408,7 @@ def test_triton_sparse_mla_fallback_allows_cudagraph_support_by_default(
             max_cudagraph_capture_size=4,
         )
     )
-    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
+    disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
     assert vllm_config.compilation_config.compile_sizes == [1, 2]
@@ -2422,7 +2422,7 @@ def test_triton_sparse_mla_fallback_allows_cudagraph_support_by_default(
 
 
 
-def test_triton_sparse_mla_fallback_can_disable_cudagraphs(monkeypatch) -> None:
+def test_triton_sparse_mla_path_can_disable_cudagraphs(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "0")
 
@@ -2464,7 +2464,7 @@ def test_triton_sparse_mla_fallback_can_disable_cudagraphs(monkeypatch) -> None:
             max_cudagraph_capture_size=4,
         )
     )
-    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
+    disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.compile_sizes == []
@@ -2474,7 +2474,7 @@ def test_triton_sparse_mla_fallback_can_disable_cudagraphs(monkeypatch) -> None:
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
 
 
-def test_triton_sparse_mla_fallback_disables_cudagraphs_for_mtp(
+def test_triton_sparse_mla_path_disables_cudagraphs_for_mtp(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
@@ -2524,7 +2524,7 @@ def test_triton_sparse_mla_fallback_disables_cudagraphs_for_mtp(
         swa_spec,
     ) is AttentionCGSupport.NEVER
 
-    disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config)
+    disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.NONE
     assert vllm_config.compilation_config.compile_sizes == []

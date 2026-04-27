@@ -17,9 +17,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_sparse_mla_attention_dump_enabled,
-    is_sparse_mla_reference_attention_enabled,
-    is_sparse_mla_reference_attention_enabled_for_platform,
-    sparse_mla_reference_cudagraphs_allowed,
+    is_triton_sparse_mla_enabled,
+    is_triton_sparse_mla_enabled_for_platform,
+    triton_sparse_mla_cudagraphs_allowed,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
@@ -211,8 +211,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     ) -> AttentionCGSupport:
         if (
             getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
-            and is_sparse_mla_reference_attention_enabled_for_platform()
-            and not sparse_mla_reference_cudagraphs_allowed(vllm_config)
+            and is_triton_sparse_mla_enabled_for_platform()
+            and not triton_sparse_mla_cudagraphs_allowed(vllm_config)
         ):
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support
@@ -389,7 +389,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             return out
         if (
             is_sparse_mla_attention_dump_enabled()
-            or is_sparse_mla_reference_attention_enabled(self.device)
+            or is_triton_sparse_mla_enabled(self.device)
         ):
             return out
         for layer_type in self._layer_types:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Environment controls for the portable sparse MLA fallback."""
+"""Environment controls for the portable Triton sparse MLA path."""
 
 import os
 
@@ -52,19 +52,19 @@ def is_sparse_mla_attention_dump_enabled() -> bool:
     return False
 
 
-def sparse_mla_reference_attention_configured() -> bool | None:
+def triton_sparse_mla_configured() -> bool | None:
     return _optional_env_flag(_TRITON_MLA_SPARSE_ENV)
 
 
-def is_sparse_mla_reference_attention_enabled_for_platform() -> bool:
-    configured = sparse_mla_reference_attention_configured()
+def is_triton_sparse_mla_enabled_for_platform() -> bool:
+    configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
     return current_platform.is_device_capability_family(120)
 
 
-def is_sparse_mla_reference_attention_enabled(device: torch.device) -> bool:
-    configured = sparse_mla_reference_attention_configured()
+def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
+    configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
     return _is_sm12x_device(device)
@@ -74,7 +74,7 @@ def _uses_speculative_decoding(vllm_config) -> bool:
     return bool(getattr(vllm_config, "speculative_config", None))
 
 
-def sparse_mla_reference_cudagraphs_allowed(vllm_config=None) -> bool:
+def triton_sparse_mla_cudagraphs_allowed(vllm_config=None) -> bool:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
     if configured is not None:
         return configured
@@ -83,13 +83,13 @@ def sparse_mla_reference_cudagraphs_allowed(vllm_config=None) -> bool:
     )
 
 
-def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
-    if not is_sparse_mla_reference_attention_enabled_for_platform():
+def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
+    if not is_triton_sparse_mla_enabled_for_platform():
         return
-    if sparse_mla_reference_cudagraphs_allowed(vllm_config):
+    if triton_sparse_mla_cudagraphs_allowed(vllm_config):
         logger.warning_once(
             "Keeping vLLM compile and CUDA graphs enabled for the DeepSeek V4 "
-            "Triton sparse MLA fallback because "
+            "Triton sparse MLA path because "
             f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1 or speculative "
             "decoding is not configured. This is an "
             "experimental performance mode."
@@ -107,7 +107,7 @@ def disable_sparse_mla_reference_cudagraphs_if_enabled(vllm_config) -> None:
 
     logger.warning_once(
         "Disabling vLLM compile and CUDA graphs for the DeepSeek V4 Triton "
-        "sparse MLA fallback because the current fallback path is not "
+        "sparse MLA path because the current Triton sparse MLA path is not "
         "compile/graph-safe yet, or because speculative decoding uses "
         "multi-token sparse MLA decode."
     )
@@ -126,7 +126,7 @@ def sparse_mla_attention_dump_path() -> str:
     )
 
 
-def sparse_mla_reference_topk_chunk_size() -> int:
+def triton_sparse_mla_topk_chunk_size() -> int:
     raw_value = os.getenv(_TRITON_MLA_SPARSE_TOPK_CHUNK_ENV)
     if raw_value is None:
         return 512
@@ -136,7 +136,7 @@ def sparse_mla_reference_topk_chunk_size() -> int:
         return 512
 
 
-def sparse_mla_reference_query_chunk_size() -> int:
+def triton_sparse_mla_query_chunk_size() -> int:
     raw_value = os.getenv(_TRITON_MLA_SPARSE_QUERY_CHUNK_ENV)
     if raw_value is None:
         return 256
@@ -146,7 +146,7 @@ def sparse_mla_reference_query_chunk_size() -> int:
         return 256
 
 
-def sparse_mla_reference_head_block_size() -> int | None:
+def triton_sparse_mla_head_block_size() -> int | None:
     raw_value = os.getenv(_TRITON_MLA_SPARSE_HEAD_BLOCK_ENV)
     if raw_value is None:
         return None
@@ -159,7 +159,7 @@ def sparse_mla_reference_head_block_size() -> int | None:
     return None
 
 
-def sparse_mla_matmul_decode_enabled() -> bool:
+def triton_sparse_mla_matmul_decode_enabled() -> bool:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_MATMUL_DECODE_ENV)
     if configured is not None:
         return configured
