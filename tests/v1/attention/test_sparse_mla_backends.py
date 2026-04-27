@@ -85,7 +85,7 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_fp8_mqa_logits_torch_reference_streams_head_chunks(
+def test_sm120_fp8_mqa_logits_torch_path_streams_head_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ):
     torch.manual_seed(0)
@@ -112,7 +112,7 @@ def test_sm120_fp8_mqa_logits_torch_reference_streams_head_chunks(
     kv_scale = (kv_amax / 448.0).squeeze(1).contiguous()
     kv_fp8 = (kv * (1.0 / kv_scale[:, None])).to(torch.float8_e4m3fn)
 
-    logits = deep_gemm_utils._fp8_mqa_logits_torch_reference(
+    logits = deep_gemm_utils._fp8_mqa_logits_torch(
         (q_fp8, None),
         (kv_fp8, kv_scale),
         weights,
@@ -176,7 +176,7 @@ def test_sm120_fp8_mqa_logits_topk_streams_k_chunks(
         topk_tokens,
     )
 
-    logits = deep_gemm_utils._fp8_mqa_logits_torch_reference(
+    logits = deep_gemm_utils._fp8_mqa_logits_torch(
         (q_fp8, None),
         (kv_fp8, kv_scale),
         weights,

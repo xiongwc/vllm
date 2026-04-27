@@ -75,13 +75,13 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    disable_sparse_mla_reference_cudagraphs_if_enabled,
+    disable_triton_sparse_mla_cudagraphs_if_enabled,
     is_sparse_mla_attention_dump_enabled,
-    is_sparse_mla_reference_attention_enabled,
+    is_triton_sparse_mla_enabled,
     sparse_mla_attention_dump_path,
-    sparse_mla_matmul_decode_enabled,
-    sparse_mla_reference_query_chunk_size,
-    sparse_mla_reference_topk_chunk_size,
+    triton_sparse_mla_matmul_decode_enabled,
+    triton_sparse_mla_query_chunk_size,
+    triton_sparse_mla_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
@@ -374,7 +374,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.compress_ratio = compress_ratio if compress_ratio is not None else 1
         self.prefix = prefix
 
-        disable_sparse_mla_reference_cudagraphs_if_enabled(mla_modules.vllm_config)
+        disable_triton_sparse_mla_cudagraphs_if_enabled(mla_modules.vllm_config)
 
         # Extract config from vllm_config
         config = mla_modules.vllm_config.model_config.hf_config
@@ -937,7 +937,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             model_version="deepseek_v4",
         )
 
-    def _forward_sparse_mla_swa_decode_reference(
+    def _forward_sparse_mla_swa_decode_triton(
         self,
         q: torch.Tensor,
         swa_k_cache: torch.Tensor,
@@ -1006,7 +1006,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
-    def _forward_sparse_mla_compressed_decode_reference(
+    def _forward_sparse_mla_compressed_decode_triton(
         self,
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor,
@@ -1019,7 +1019,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
     ) -> None:
         if self.compress_ratio not in (4, 128):
             raise NotImplementedError(
-                "Sparse MLA reference compressed decode currently supports "
+                "Triton sparse MLA compressed decode currently supports "
                 f"compress_ratio=4 or 128, got {self.compress_ratio}"
             )
 
@@ -1032,7 +1032,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_topk = topk_indices.shape[-1]
         topk_chunk_size = min(
             compressed_topk,
-            sparse_mla_reference_topk_chunk_size(),
+            triton_sparse_mla_topk_chunk_size(),
         )
         compressed_slot_ids = topk_indices[:, 0, :]
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
@@ -1041,7 +1041,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if (
             not mtp_decode
             and compressed_topk <= topk_chunk_size
-            and sparse_mla_matmul_decode_enabled()
+            and triton_sparse_mla_matmul_decode_enabled()
         ):
             total_candidates = compressed_topk + max_swa_len
             (
@@ -1186,7 +1186,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
-    def _forward_sparse_mla_prefill_reference(
+    def _forward_sparse_mla_prefill_triton(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -1198,11 +1198,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv_flat = kv.reshape(-1, q.shape[-1])
         topk_chunk_size = min(
             combined_indices.shape[-1],
-            sparse_mla_reference_topk_chunk_size(),
+            triton_sparse_mla_topk_chunk_size(),
         )
         query_chunk_size = min(
             q.shape[0],
-            sparse_mla_reference_query_chunk_size(),
+            triton_sparse_mla_query_chunk_size(),
         )
         if state_buffers is None:
             (
@@ -1393,9 +1393,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             fields=decode_fields,
         )
 
-        if is_sparse_mla_reference_attention_enabled(q.device):
+        if is_triton_sparse_mla_enabled(q.device):
             if swa_only:
-                self._forward_sparse_mla_swa_decode_reference(
+                self._forward_sparse_mla_swa_decode_triton(
                     q=q,
                     swa_k_cache=self.swa_cache_layer.kv_cache,
                     swa_metadata=swa_metadata,
@@ -1407,7 +1407,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 assert topk_indices is not None
                 assert topk_lens is not None
-                self._forward_sparse_mla_compressed_decode_reference(
+                self._forward_sparse_mla_compressed_decode_triton(
                     q=q,
                     compressed_k_cache=compressed_k_cache,
                     swa_k_cache=self.swa_cache_layer.kv_cache,
@@ -1544,12 +1544,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
 
         workspace_manager = current_workspace_manager()
-        reference_attention_enabled = is_sparse_mla_reference_attention_enabled(
+        triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(
             q.device
         )
-        if reference_attention_enabled:
+        if triton_sparse_mla_enabled:
             query_chunk_size = min(
-                q.shape[0], sparse_mla_reference_query_chunk_size()
+                q.shape[0], triton_sparse_mla_query_chunk_size()
             )
             (
                 kv,
@@ -1663,8 +1663,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     },
                 )
 
-            if reference_attention_enabled:
-                self._forward_sparse_mla_prefill_reference(
+            if triton_sparse_mla_enabled:
+                self._forward_sparse_mla_prefill_triton(
                     q=q[query_start:query_end],
                     kv=kv[:chunk_size],
                     combined_indices=combined_indices,

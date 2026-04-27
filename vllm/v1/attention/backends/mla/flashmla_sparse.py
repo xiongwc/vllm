@@ -31,8 +31,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    is_sparse_mla_reference_attention_enabled_for_platform,
-    sparse_mla_reference_cudagraphs_allowed,
+    is_triton_sparse_mla_enabled_for_platform,
+    triton_sparse_mla_cudagraphs_allowed,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
@@ -278,8 +278,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
     ) -> AttentionCGSupport:
         if (
             getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
-            and is_sparse_mla_reference_attention_enabled_for_platform()
-            and not sparse_mla_reference_cudagraphs_allowed(vllm_config)
+            and is_triton_sparse_mla_enabled_for_platform()
+            and not triton_sparse_mla_cudagraphs_allowed(vllm_config)
         ):
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support

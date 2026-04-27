@@ -6,7 +6,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    sparse_mla_reference_head_block_size,
+    triton_sparse_mla_head_block_size,
 )
 
 
@@ -18,7 +18,7 @@ def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
     reuse each dequantized KV row across multiple heads.
     """
 
-    configured_head_block_size = sparse_mla_reference_head_block_size()
+    configured_head_block_size = triton_sparse_mla_head_block_size()
     if configured_head_block_size is not None:
         return configured_head_block_size
     if num_decode_tokens <= 4:
@@ -277,7 +277,7 @@ def build_combined_sparse_mla_decode_valid_mask(
     topk_lens: torch.Tensor,
     swa_lens: torch.Tensor,
 ) -> None:
-    """Build `[compressed, SWA]` validity mask for SM12x decode fallback."""
+    """Build `[compressed, SWA]` validity mask for SM12x decode."""
     if compressed_slot_ids.dim() == 3:
         assert compressed_slot_ids.shape[1] == 1
         compressed_slot_ids = compressed_slot_ids[:, 0, :]
@@ -325,7 +325,7 @@ def matmul_sparse_mla_attention_with_sink(
 
     This path intentionally dequantizes/gathers KV once and then reuses it
     across all heads with batched matrix multiplications. It is useful for the
-    SM12x decode fallback where the direct Triton reference kernel otherwise
+    SM12x decode path where the direct Triton kernel otherwise
     repeats fp8_ds_mla dequantization once per head group.
     """
     if q.dim() == 4:
