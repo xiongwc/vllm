@@ -10,6 +10,7 @@ import pytest
 from vllm.entrypoints.chat_utils import parse_chat_messages
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+from vllm.tokenizers.deepseek_v4_encoding import encode_arguments_to_dsml
 from vllm.tokenizers.registry import TokenizerRegistry
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "deepseek_v4"
@@ -180,6 +181,66 @@ def test_deepseek_v4_renders_parsed_history_tool_arguments():
     assert '<｜DSML｜parameter name="command" string="true">view' in prompt
     assert '<｜DSML｜parameter name="path" string="true">/testbed' in prompt
     assert 'parameter name="arguments"' not in prompt
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "expected_parameter"),
+    [
+        ({"name": "refresh", "arguments": None}, None),
+        ({"name": "refresh"}, None),
+        ({"name": "refresh", "arguments": ""}, None),
+        (
+            {"name": "refresh", "arguments": '{"target": "cache"}'},
+            '<｜DSML｜parameter name="target" string="true">cache',
+        ),
+        (
+            {"name": "refresh", "arguments": {"target": "cache"}},
+            '<｜DSML｜parameter name="target" string="true">cache',
+        ),
+    ],
+)
+def test_deepseek_v4_encodes_empty_history_tool_arguments(
+    tool_call, expected_parameter
+):
+    prompt = encode_arguments_to_dsml(tool_call)
+
+    if expected_parameter is None:
+        assert prompt == ""
+    else:
+        assert expected_parameter in prompt
+
+
+def test_deepseek_v4_renders_openai_history_tool_call_with_null_arguments():
+    messages = [
+        {"role": "user", "content": "Refresh state"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "refresh",
+                        "arguments": None,
+                    },
+                }
+            ],
+        },
+    ]
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation=conversation,
+        messages=messages,
+        tokenize=False,
+    )
+
+    assert '<｜DSML｜invoke name="refresh">' in prompt
+    assert "<｜DSML｜parameter" not in prompt
 
 
 @pytest.mark.parametrize("reasoning_effort", ["none", "low", "medium", "high"])
