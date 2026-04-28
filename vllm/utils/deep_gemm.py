@@ -344,6 +344,7 @@ def transform_sf_into_required_layout(*args, **kwargs):
 
 
 _SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
+_SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 8192
 
 
 def _fp8_mqa_logits_head_chunk_size(
@@ -705,6 +706,73 @@ def _fp8_paged_mqa_logits_sm12x(
     )
 
 
+def fp8_fp4_paged_mqa_topk_indices(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Write SM120 FP8 paged MQA top-k indices without full logits."""
+    _lazy_init()
+    q_values, q_scale = q
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and q_scale is None
+        and q_values.dim() == 4
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.shape[-1] == q_values.shape[-1] + 4
+    ):
+        return False
+
+    num_rows = q_values.shape[0] * q_values.shape[1]
+    topk_tokens = topk_indices.shape[1]
+    assert topk_indices.shape == (num_rows, topk_tokens)
+    assert topk_indices.dtype == torch.int32
+    topk_indices.fill_(-1)
+    if num_rows == 0 or topk_tokens == 0 or max_model_len == 0:
+        return True
+
+    best_values = torch.full(
+        (num_rows, topk_tokens),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    chunk_size = max(1, _SM120_PAGED_MQA_TOPK_CHUNK_SIZE)
+
+    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+        fp8_paged_mqa_logits_triton,
+    )
+
+    for token_start in range(0, max_model_len, chunk_size):
+        token_count = min(chunk_size, max_model_len - token_start)
+        chunk_logits = fp8_paged_mqa_logits_triton(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            token_start=token_start,
+            token_count=token_count,
+        )
+        chunk_topk = min(topk_tokens, token_count)
+        chunk_values, chunk_indices = torch.topk(chunk_logits, chunk_topk, dim=1)
+        chunk_indices = (chunk_indices + token_start).to(torch.int32)
+
+        candidate_values = torch.cat((best_values, chunk_values), dim=1)
+        candidate_indices = torch.cat((topk_indices, chunk_indices), dim=1)
+        best_values, selected = torch.topk(candidate_values, topk_tokens, dim=1)
+        topk_indices.copy_(candidate_indices.gather(1, selected))
+        topk_indices.masked_fill_(~torch.isfinite(best_values), -1)
+
+    return True
+
+
 def fp8_fp4_paged_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
@@ -925,6 +993,7 @@ __all__ = [
     "fp8_fp4_mqa_logits",
     "fp8_fp4_mqa_topk_indices",
     "fp8_fp4_paged_mqa_logits",
+    "fp8_fp4_paged_mqa_topk_indices",
     "get_paged_mqa_logits_metadata",
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
