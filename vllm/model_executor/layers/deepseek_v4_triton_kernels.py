@@ -748,8 +748,9 @@ def _fp8_paged_mqa_logits_kernel(
     context_lens_ptr,
     block_tables_ptr,
     logits_ptr,
+    token_start,
     num_rows: tl.constexpr,
-    max_model_len: tl.constexpr,
+    logits_width: tl.constexpr,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -778,11 +779,12 @@ def _fp8_paged_mqa_logits_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_local_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = token_start + offs_local_n
     offs_d = tl.arange(0, BLOCK_D)
 
     valid_m = offs_m < num_rows
-    valid_n = offs_n < max_model_len
+    valid_n = offs_local_n < logits_width
     batch = offs_m // next_n
     q_pos = offs_m - batch * next_n
     context_len = tl.load(
@@ -841,7 +843,7 @@ def _fp8_paged_mqa_logits_kernel(
     store_mask = valid_m[:, None] & valid_n[None, :]
     logits = tl.where(context_mask & store_mask, logits, float("-inf"))
     tl.store(
-        logits_ptr + offs_m[:, None] * stride_lm + offs_n[None, :] * stride_ln,
+        logits_ptr + offs_m[:, None] * stride_lm + offs_local_n[None, :] * stride_ln,
         logits,
         mask=store_mask,
     )
@@ -854,24 +856,31 @@ def fp8_paged_mqa_logits_triton(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    token_start: int = 0,
+    token_count: int | None = None,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
     kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
     kv_scale = kv_cache[..., head_dim:].contiguous().view(torch.float32)
     _, block_size, _, _ = kv_values.size()
     num_rows = batch_size * next_n
+    if token_count is None:
+        token_count = max_model_len - token_start
+    assert token_start >= 0
+    assert token_count >= 0
+    assert token_start + token_count <= max_model_len
     logits = torch.empty(
-        (num_rows, max_model_len),
+        (num_rows, token_count),
         device=q.device,
         dtype=torch.float32,
     )
-    if num_rows == 0 or max_model_len == 0:
+    if num_rows == 0 or token_count == 0:
         return logits
 
     context_lens_2d = context_lens.reshape(batch_size, -1)
     if context_lens_2d.shape[1] == 1 and next_n != 1:
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
-    grid = (triton.cdiv(num_rows, 4), triton.cdiv(max_model_len, 64))
+    grid = (triton.cdiv(num_rows, 4), triton.cdiv(token_count, 64))
     _fp8_paged_mqa_logits_kernel[grid](
         q,
         kv_values,
@@ -880,8 +889,9 @@ def fp8_paged_mqa_logits_triton(
         context_lens_2d,
         block_tables,
         logits,
+        token_start,
         num_rows,
-        max_model_len,
+        token_count,
         next_n,
         num_heads,
         head_dim,

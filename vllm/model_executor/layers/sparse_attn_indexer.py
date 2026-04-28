@@ -13,6 +13,7 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_mqa_topk_indices,
     fp8_fp4_paged_mqa_logits,
+    fp8_fp4_paged_mqa_topk_indices,
     has_deep_gemm,
 )
 from vllm.utils.torch_utils import (
@@ -345,56 +346,34 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-            clean_logits=False,
-        )
-        num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        logits_bytes = num_padded_tokens * max_model_len * torch.float32.itemsize
+        used_direct_topk = False
+        if logits_bytes > sparse_indexer_max_logits_bytes():
+            used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+                topk_indices,
+            )
 
-        if _use_sm120_short_row_topk_decode(logits, topk_tokens):
-            torch.ops._C.top_k_per_row_decode(
-                logits,
-                next_n,
+        if not used_direct_topk:
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                weights[:num_padded_tokens],
                 seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
             )
-        elif current_platform.is_cuda() and topk_tokens in (512, 2048):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
-            )
-        else:
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
-                    logits,
-                    next_n,
-                    seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
-            else:
+            num_rows = logits.shape[0]
+
+            if _use_sm120_short_row_topk_decode(logits, topk_tokens):
                 torch.ops._C.top_k_per_row_decode(
                     logits,
                     next_n,
@@ -405,6 +384,42 @@ def sparse_attn_indexer(
                     logits.stride(1),
                     topk_tokens,
                 )
+            elif current_platform.is_cuda() and topk_tokens in (512, 2048):
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            else:
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_decode(  # type: ignore[attr-defined]
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
