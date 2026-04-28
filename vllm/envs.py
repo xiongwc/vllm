@@ -166,7 +166,6 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
-    VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_DUMP: bool = False
     VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str = ""
@@ -1274,10 +1273,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
-    ),
-    # Enable DeepGEMM's SM120 paged MQA tiled kernel when available.
-    "VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED": lambda: bool(
-        int(os.getenv("VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED", "1"))
     ),
     # Experimental sparse MLA fallback controls.
     # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
