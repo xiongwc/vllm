@@ -46,14 +46,21 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
 from vllm.model_executor.layers.deepseek_v4_profile import (
+    deepseek_v4_profile_active,
+    deepseek_v4_profile_lens,
     deepseek_v4_profile_region,
+    deepseek_v4_profile_stat,
 )
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -165,6 +172,43 @@ def _allocate_deepseek_v4_wo_a_output(
     (output,) = current_workspace_manager().get_simultaneous(
         (shape, dtype),
     )
+    return output
+
+
+def _profile_deepseek_v4_row_parallel_linear(
+    layer: nn.Module,
+    input_: torch.Tensor,
+    profile_prefix: str,
+) -> torch.Tensor:
+    if layer.input_is_parallel:
+        input_parallel = input_
+    else:
+        with deepseek_v4_profile_region(f"{profile_prefix}.input_split"):
+            split_input = split_tensor_along_last_dim(
+                input_,
+                num_partitions=layer.tp_size,
+            )
+            input_parallel = split_input[layer.tp_rank].contiguous()
+
+    assert layer.quant_method is not None
+    bias = None if (layer.tp_rank > 0 or layer.skip_bias_add) else layer.bias
+    with deepseek_v4_profile_region(f"{profile_prefix}.gemm"):
+        output_parallel = layer.quant_method.apply(layer, input_parallel, bias)
+
+    if layer.reduce_results and layer.tp_size > 1:
+        with deepseek_v4_profile_region(f"{profile_prefix}.all_reduce"):
+            output = tensor_model_parallel_all_reduce(output_parallel)
+    else:
+        output = output_parallel
+
+    if not layer.return_bias:
+        return output
+
+    output_bias = layer.bias if layer.skip_bias_add else None
+    if output_bias is not None:
+        raise NotImplementedError(
+            "DeepSeek V4 row-parallel profiling does not support returning bias"
+        )
     return output
 
 
@@ -433,10 +477,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
 
         with deepseek_v4_profile_region("attention.wo_b"):
-            return self.wo_b(z.flatten(1))
+            z_flat = z.flatten(1)
+            if deepseek_v4_profile_active():
+                return _profile_deepseek_v4_row_parallel_linear(
+                    self.wo_b,
+                    z_flat,
+                    "attention.wo_b",
+                )
+            return self.wo_b(z_flat)
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
-        assert self.aux_stream_list is not None
         assert len(self.aux_stream_list) >= 3
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
@@ -449,9 +499,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, compressor.fused_wkv_wgate.weight
-                )
+                with deepseek_v4_profile_region("attention.gemm.compressor_score"):
+                    return cublas_gemm_bf16_bf16_fp32(
+                        hidden_states, compressor.fused_wkv_wgate.weight
+                    )
 
             aux_fns[0] = compressor_kv_score
 
@@ -460,20 +511,23 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
             def indexer_weights_proj() -> torch.Tensor:
                 # ReplicatedLinear returns (output, bias); bias is None.
-                weights, _ = indexer.weights_proj(hidden_states)
+                with deepseek_v4_profile_region("attention.gemm.indexer_weights"):
+                    weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
-                )
+                with deepseek_v4_profile_region("attention.gemm.indexer_score"):
+                    return cublas_gemm_bf16_bf16_fp32(
+                        hidden_states, indexer.compressor.fused_wkv_wgate.weight
+                    )
 
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
             # MergedColumnParallelLinear returns (output, bias); bias is None.
-            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+            with deepseek_v4_profile_region("attention.gemm.fused_wqa_wkv"):
+                qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
@@ -515,7 +569,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
-            assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
@@ -523,9 +576,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def wq_b_kv_insert_and_compress() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
-                compressor(kv_score, positions, self.rotary_emb)
+                with deepseek_v4_profile_region("attention.wq_b"):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with deepseek_v4_profile_region("attention.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                with deepseek_v4_profile_region("attention.compressor"):
+                    compressor(kv_score, positions, self.rotary_emb)
                 return q
 
             with deepseek_v4_profile_region("attention.wq_insert_compress_indexer"):
@@ -545,19 +601,24 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
-            assert self.aux_stream_list is not None
             aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                with deepseek_v4_profile_region("attention.wq_b"):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with deepseek_v4_profile_region("attention.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
+
+            def compress_kv() -> None:
+                with deepseek_v4_profile_region("attention.compressor"):
+                    compressor(kv_score, positions, self.rotary_emb)
 
             with deepseek_v4_profile_region("attention.wq_insert_compress"):
                 q, _ = maybe_execute_in_parallel(
                     wq_b_kv_insert,
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    compress_kv,
                     self.ln_events[0],
                     self.ln_events[1],
                     aux_stream,
@@ -565,8 +626,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         else:
             # SWA-only layer: no compressor, no overlap.
             with deepseek_v4_profile_region("attention.wq_insert"):
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+                with deepseek_v4_profile_region("attention.wq_b"):
+                    q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                with deepseek_v4_profile_region("attention.kv_insert"):
+                    self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
@@ -845,6 +908,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        deepseek_v4_profile_stat("sparse_mla.swa_decode.tokens", num_decode_tokens)
+        deepseek_v4_profile_stat("sparse_mla.swa_decode.seqs", num_decodes)
+        deepseek_v4_profile_stat("sparse_mla.swa_decode.head_block", head_block_size)
+        deepseek_v4_profile_stat("sparse_mla.swa_decode.mtp", int(mtp_decode))
+        deepseek_v4_profile_lens("sparse_mla.swa_decode.lens", swa_lens)
         if not mtp_decode:
             with deepseek_v4_profile_region("sparse_mla.swa_paged"):
                 fp8ds_paged_sparse_mla_attention_with_sink_multihead(
@@ -934,6 +1002,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.tokens", num_decode_tokens)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.seqs", num_decodes)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.topk", compressed_topk)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.topk_chunk", topk_chunk_size)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.head_block", head_block_size)
+        deepseek_v4_profile_stat("sparse_mla.comp_decode.mtp", int(mtp_decode))
+        deepseek_v4_profile_lens("sparse_mla.comp_decode.topk_lens", topk_lens)
+        deepseek_v4_profile_lens("sparse_mla.comp_decode.swa_lens", swa_lens)
         if (
             compressed_topk <= topk_chunk_size
             and triton_sparse_mla_matmul_decode_enabled()
@@ -1121,6 +1197,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             q.shape[0],
             triton_sparse_mla_query_chunk_size(),
         )
+        deepseek_v4_profile_stat("sparse_mla.prefill_tokens", q.shape[0])
+        deepseek_v4_profile_stat("sparse_mla.prefill.topk_chunk", topk_chunk_size)
+        deepseek_v4_profile_stat("sparse_mla.prefill.query_chunk", query_chunk_size)
+        deepseek_v4_profile_lens("sparse_mla.prefill.combined_lens", combined_lens)
         if state_buffers is None:
             (
                 max_score_buffer,

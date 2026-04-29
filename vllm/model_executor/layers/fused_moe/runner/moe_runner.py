@@ -17,6 +17,9 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.model_executor.layers.deepseek_v4_profile import (
+    deepseek_v4_profile_region,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
@@ -431,7 +434,8 @@ class MoERunner(MoERunnerInterface):
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts.apply(shared_experts_input, order)
+            with deepseek_v4_profile_region(f"moe.shared.{order.name.lower()}"):
+                self._shared_experts.apply(shared_experts_input, order)
 
     def _apply_quant_method(
         self,
@@ -452,28 +456,31 @@ class MoERunner(MoERunnerInterface):
         )
 
         if self.quant_method.is_monolithic:
-            fused_out = self.quant_method.apply_monolithic(
-                layer=layer,
-                x=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with deepseek_v4_profile_region("moe.quant.monolithic"):
+                fused_out = self.quant_method.apply_monolithic(
+                    layer=layer,
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with deepseek_v4_profile_region("moe.router.select"):
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
-            fused_out = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_experts_input,
-            )
+            with deepseek_v4_profile_region("moe.quant.apply"):
+                fused_out = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -510,7 +517,10 @@ class MoERunner(MoERunnerInterface):
         #        separate cuda stream)
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
+            with deepseek_v4_profile_region("moe.shared.sync"):
+                self._shared_experts.maybe_sync_shared_experts_stream(
+                    shared_experts_input
+                )
 
     def _maybe_add_zero_expert_output(
         self,
@@ -698,7 +708,8 @@ class MoERunner(MoERunnerInterface):
         Returns a single tensor of combined fused and shared output (if present).
         """
         # TODO(bnell): this can be removed after MK migration is complete.
-        layer.ensure_moe_quant_config_init()
+        with deepseek_v4_profile_region("moe.ensure_quant_config"):
+            layer.ensure_moe_quant_config_init()
 
         # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(shared_experts_input)
@@ -707,27 +718,31 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+            with deepseek_v4_profile_region("moe.gate"):
+                router_logits, _ = self.gate(hidden_states)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                layer,
-                hidden_states,
-                router_logits,
-            )
+            with deepseek_v4_profile_region("moe.dispatch"):
+                hidden_states, router_logits = self._maybe_dispatch(
+                    layer,
+                    hidden_states,
+                    router_logits,
+                )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                layer=layer,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-            )
+            with deepseek_v4_profile_region("moe.apply_quant_method"):
+                shared_output, hidden_states = self._apply_quant_method(
+                    layer=layer,
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                )
 
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+            with deepseek_v4_profile_region("moe.combine"):
+                return self._maybe_combine(
+                    shared_output,
+                    hidden_states,
+                )

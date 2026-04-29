@@ -122,9 +122,12 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        with deepseek_v4_profile_region("ffn.shared.gate_up"):
+            gate_up, _ = self.gate_up_proj(x)
+        with deepseek_v4_profile_region("ffn.shared.act"):
+            x = self.act_fn(gate_up)
+        with deepseek_v4_profile_region("ffn.shared.down"):
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -878,34 +881,39 @@ class DeepseekV4MoE(nn.Module):
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
-        router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+        with deepseek_v4_profile_region("ffn.moe.gate"):
+            router_logits, _ = self.gate(hidden_states)
+        with deepseek_v4_profile_region("ffn.moe.topk"):
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
+        with deepseek_v4_profile_region("ffn.moe.routed_experts"):
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
+            with deepseek_v4_profile_region("ffn.moe.shared_experts"):
+                shared_output = self.shared_experts(hidden_states)
+            with deepseek_v4_profile_region("ffn.moe.shared_add"):
+                final_hidden_states += shared_output
 
         return final_hidden_states.view(org_shape)
 
@@ -915,18 +923,21 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                input_ids=input_ids,
-            )
+            with deepseek_v4_profile_region("ffn.moe.fused_internal"):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=hidden_states,
+                    input_ids=input_ids,
+                )
         else:
-            router_logits, _ = self.gate(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+            with deepseek_v4_profile_region("ffn.moe.gate"):
+                router_logits, _ = self.gate(hidden_states)
+            with deepseek_v4_profile_region("ffn.moe.fused_experts"):
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
 
         return final_hidden_states.view(org_shape)
 

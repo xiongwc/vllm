@@ -7,6 +7,7 @@ It uses CUDA events around coarse model regions so we can compare decode
 component costs without requiring an external Nsight capture for every run.
 """
 
+import os
 import threading
 from collections import defaultdict
 from contextlib import nullcontext
@@ -47,6 +48,7 @@ class _DeepSeekV4ProfileSample:
         self.step = step
         self.num_tokens = num_tokens
         self.regions: list[_TimedRegion] = []
+        self.stats: dict[str, str] = {}
 
     def region(self, name: str):
         return _ProfileRegion(self, name)
@@ -58,6 +60,9 @@ class _DeepSeekV4ProfileSample:
         end: torch.cuda.Event,
     ) -> None:
         self.regions.append(_TimedRegion(name, start, end))
+
+    def add_stat(self, name: str, value: Any) -> None:
+        self.stats[name] = str(value)
 
     def log(self) -> None:
         if not self.regions:
@@ -84,10 +89,18 @@ class _DeepSeekV4ProfileSample:
                 f"avg={avg_ms:.3f}ms {pct:.1f}%"
             )
 
+        stats = (
+            " stats: "
+            + ", ".join(f"{name}={value}" for name, value in sorted(self.stats.items()))
+            if self.stats
+            else ""
+        )
         logger.info(
-            "DeepSeek V4 profile step=%d tokens=%d: %s",
+            "DeepSeek V4 profile %s step=%d tokens=%d:%s %s",
+            _worker_label(),
             self.step,
             self.num_tokens,
+            stats,
             "; ".join(parts),
         )
 
@@ -151,3 +164,44 @@ def deepseek_v4_profile_region(name: str):
     if sample is None:
         return nullcontext()
     return sample.region(name)
+
+
+def deepseek_v4_profile_active() -> bool:
+    return getattr(_tls, "sample", None) is not None
+
+
+def deepseek_v4_profile_stat(name: str, value: Any) -> None:
+    sample = getattr(_tls, "sample", None)
+    if sample is None:
+        return
+    sample.add_stat(name, value)
+
+
+def deepseek_v4_profile_lens(name: str, lens: torch.Tensor) -> None:
+    sample = getattr(_tls, "sample", None)
+    if sample is None:
+        return
+    if lens.numel() == 0:
+        sample.add_stat(name, "empty")
+        return
+
+    lens_fp32 = lens.detach().to(torch.float32)
+    min_len = int(lens.min().item())
+    max_len = int(lens.max().item())
+    avg_len = float(lens_fp32.mean().item())
+    sample.add_stat(name, f"min={min_len},avg={avg_len:.1f},max={max_len}")
+
+
+def _worker_label() -> str:
+    parts = [f"pid={os.getpid()}"]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            parts.append(f"rank={torch.distributed.get_rank()}")
+            parts.append(f"world={torch.distributed.get_world_size()}")
+        except RuntimeError:
+            pass
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        parts.append(f"cuda={device}")
+        parts.append(f"gpu={torch.cuda.get_device_name(device)}")
+    return " ".join(parts)
